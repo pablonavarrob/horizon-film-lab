@@ -33,7 +33,7 @@ Density, contrast, and colour are kept fully independent of each other — movin
 There's also a roll-level colour cast meter (⌘K to measure, ⇧⌘K to apply) and a review grid (⌘G) for checking a whole roll at a consistent size before you commit to a look.
 
 
-![Grid mode (6 images at a time)](Resources/grid mode.png)
+![Grid mode (6 images at a time)](Resources/grid%20mode.png)
 
 
 ![Comparison with a real Frontier scan, from Malvarrosa Film Lab in Valencia](Resources/comparison.png)
