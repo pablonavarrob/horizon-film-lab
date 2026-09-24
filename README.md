@@ -8,6 +8,10 @@ Feed it raw captures from whatever you're scanning with, and it does the density
 
 The name's a nod to the old Fuji Frontier scanners — same mount-and-minilab lineage as the Noritsu machines, that whole era of scanning hardware — which is where the look and the workflow take their cues from, not a rebrand of anything.
 
+
+![Screenshot of a trichromatic scan session](Resources/sample.png)
+
+
 ## How it works
 
 One pipeline, one of three ways to finish it:
@@ -28,8 +32,11 @@ Density, contrast, and colour are kept fully independent of each other — movin
 
 There's also a roll-level colour cast meter (⌘K to measure, ⇧⌘K to apply) and a review grid (⌘G) for checking a whole roll at a consistent size before you commit to a look.
 
-![Screenshot of a trichromatic scan session](Resources/sample.png)
 
+![Grid mode (6 images at a time)](Resources/grid mode.png)
+
+
+![Comparison with a real Frontier scan, from Malvarrosa Film Lab in Valencia](Resources/comparison.png)
 
 ## Building it
 
