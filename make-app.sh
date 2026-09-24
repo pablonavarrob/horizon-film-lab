@@ -24,8 +24,12 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp .build/release/horizon "$APP/Contents/MacOS/Horizon"
 cp Resources/logo.png Resources/AppIcon.icns "$APP/Contents/Resources/"
-rm -rf "$APP/Contents/Resources/luts"
-cp -R Resources/luts "$APP/Contents/Resources/"   # bundled print LUTs
+# Extra print LUTs are optional; the built-in RA-4 model needs no LUT files.
+if [ -d Resources/luts ]; then
+  cp -R Resources/luts "$APP/Contents/Resources/"
+else
+  echo "Resources/luts not found; building with the built-in print model only."
+fi
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

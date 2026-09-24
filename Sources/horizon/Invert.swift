@@ -759,7 +759,10 @@ enum Invert {
                     .filter { $0 < Float(gateCeiling) }
             }
         }
-        if pool[0].count > 16 {
+        // Gate filtering is per channel: green or blue can be empty even when
+        // red has enough samples. Keep the provisional base unless all three
+        // channels have enough data for a measured base.
+        if pool.allSatisfy({ $0.count > 16 }) {
             measured = (0..<3).map { c -> Float in
                 pool[c].sort(); return pool[c][pool[c].count / 2]
             }
