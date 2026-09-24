@@ -28,6 +28,9 @@ Density, contrast, and colour are kept fully independent of each other — movin
 
 There's also a roll-level colour cast meter (⌘K to measure, ⇧⌘K to apply) and a review grid (⌘G) for checking a whole roll at a consistent size before you commit to a look.
 
+![Screenshot of a trichromatic scan session](Resources/samples.png)
+
+
 ## Building it
 
 You'll need macOS 14 or later and a Swift toolchain (Xcode is easiest). Then:
