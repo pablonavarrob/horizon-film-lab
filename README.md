@@ -28,7 +28,7 @@ Density, contrast, and colour are kept fully independent of each other — movin
 
 There's also a roll-level colour cast meter (⌘K to measure, ⇧⌘K to apply) and a review grid (⌘G) for checking a whole roll at a consistent size before you commit to a look.
 
-![Screenshot of a trichromatic scan session](Resources/samples.png)
+![Screenshot of a trichromatic scan session](Resources/sample.png)
 
 
 ## Building it
