@@ -1,6 +1,6 @@
 # Horizon
 
-![Horizon](Resources/icon-1024.png)
+![Horizon](Resources/icon-readme.png)
 
 A macOS app for inverting scanned colour negatives and printing them the way a minilab would.
 
