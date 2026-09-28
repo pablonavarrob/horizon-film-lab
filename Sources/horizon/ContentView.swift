@@ -1,7 +1,7 @@
 import SwiftUI
 
-// Teal header, white stage, chunky silver controls. No modals: every control is
-// inline so the big preview reacts the moment you click it.
+// Teal header, white stage, chunky silver controls. Roll and export details use
+// focused dialogs; corrections remain on the main panel.
 
 struct ContentView: View {
     @ObservedObject var store: RollStore
@@ -66,7 +66,7 @@ private struct EmptyState: View {
                 Text("Drop a folder of scans here")
                     .font(.custom("Tahoma", size: 20).weight(.bold))
                     .foregroundStyle(FUI.ink)
-                Text("Raw captures get inverted and opened.\nAlready-inverted rolls just open.")
+                Text("Capture folders open with roll settings.\nAlready-inverted rolls open directly.")
                     .font(FUI.label()).foregroundStyle(FUI.ink.opacity(0.6))
                     .multilineTextAlignment(.center)
                 HStack(spacing: 8) {
@@ -76,9 +76,13 @@ private struct EmptyState: View {
                         .buttonStyle(Chunky(height: 44, minWidth: 150))
                 }
                 .padding(.top, 4)
+                if store.isProcessing {
+                    Button("Cancel Processing") { store.cancelProcessing() }
+                        .buttonStyle(Chunky(height: 32, minWidth: 150))
+                }
                 RecentRolls(store: store)               // DEV-RECENT
-                if !store.status.isEmpty {
-                    Text(store.status).font(FUI.small()).foregroundStyle(FUI.ink.opacity(0.65))
+                if !store.displayedStatus.isEmpty {
+                    Text(store.displayedStatus).font(FUI.small()).foregroundStyle(FUI.ink.opacity(0.65))
                 }
             }
             .padding(40)
@@ -98,7 +102,32 @@ private struct Header: View {
             }
             // Black text: it sits on the light half of the gradient.
             Text("Digital Image Export").font(FUI.label(true)).foregroundStyle(FUI.ink)
-            Field(text: store.current?.name ?? "", width: 250, height: 21, readOnly: true)
+            Button { store.editRollDetails() } label: {
+                HStack(spacing: 6) {
+                    Text(store.rollMetadata.title.isEmpty
+                         ? (store.current?.name ?? "Roll") : store.rollMetadata.title)
+                        .font(FUI.label(true))
+                        .foregroundStyle(FUI.ink)
+                        .lineLimit(1)
+                        .layoutPriority(1)
+                    if !store.rollMetadata.recentOrderSummary.isEmpty {
+                        Text("·")
+                            .font(FUI.small())
+                            .foregroundStyle(FUI.ink.opacity(0.38))
+                        Text(store.rollMetadata.recentOrderSummary)
+                            .font(FUI.small())
+                            .foregroundStyle(FUI.ink.opacity(0.5))
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .help(store.rollMetadata.recentOrderSummary)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .frame(minWidth: 220, idealWidth: 440, maxWidth: 520, alignment: .leading)
+            }
+            .buttonStyle(.plain)
+            .disabled(store.workspace == nil || store.isProcessing)
+            .help("Edit roll settings and roll metadata")
             // The rounded count pill sits between the order field and the label
             // on every reference screen.
             Text("\(store.frames.count)")
@@ -161,6 +190,16 @@ private struct StageImage: View {
     var body: some View {
         if let img = frame.image {
             Image(decorative: img, scale: 1).resizable().scaledToFit().padding(14)
+        } else if let error = frame.loadError {
+            VStack(spacing: 10) {
+                Text("Could not load this frame")
+                    .font(.headline).foregroundStyle(FUI.ink)
+                Text(error).font(FUI.small()).foregroundStyle(FUI.ink.opacity(0.7))
+                    .multilineTextAlignment(.center)
+                Button("Retry") { Task { await frame.reload() } }
+                    .buttonStyle(Chunky(height: 32, minWidth: 90))
+            }
+            .padding(24)
         } else {
             ProgressView().controlSize(.small)
         }
@@ -259,6 +298,9 @@ private struct GridCell: View {
             if let img = frame.image {
                 Image(decorative: img, scale: 1)
                     .resizable().aspectRatio(contentMode: .fit)
+            } else if frame.loadError != nil {
+                Image(systemName: "exclamationmark.triangle")
+                    .foregroundStyle(.orange)
             }
             VStack {
                 Spacer()
@@ -351,6 +393,9 @@ private struct Cell: View {
                     // scaledToFit, not Fill: portrait scans in a landscape gate
                     // get cropped to slivers by Fill.
                     Image(decorative: img, scale: 1).resizable().scaledToFit().padding(2)
+                } else if frame.loadError != nil {
+                    Image(systemName: "exclamationmark.triangle")
+                        .foregroundStyle(.orange)
                 }
             }
             .bevel(up: false, width: 1)
@@ -549,7 +594,7 @@ private struct Gradation: View {
     /// Stored values keep their meaning, 0 is still Normal and +2 still Strong.
     private static let curveGrades: [(String, Int)] =
         [("Very Strong", 3), ("Strong", 2), ("Medium", 1),
-         ("Normal", 0), ("Light", -1), ("Soft", -2)]
+         ("Normal", 0), ("Light", -1), ("Soft", -2), ("Soft 3", -3)]
 
     var body: some View {
         VStack(spacing: 4) {
@@ -560,7 +605,7 @@ private struct Gradation: View {
             // Two rows of three: six buttons stacked would push the panel past
             // the window, and the machine shows them as one list anyway.
             let set = store.newCurve ? Self.curveGrades : Self.grades
-            ForEach([Array(set[0..<3]), Array(set[3..<6])], id: \.first!.0) { row in
+            ForEach([Array(set.prefix(3)), Array(set.dropFirst(3))], id: \.first!.0) { row in
                 HStack(spacing: 4) {
                     ForEach(row, id: \.0) { g in
                         Button(g.0) { store.setGradation(g.1) }
@@ -659,8 +704,12 @@ private struct BottomBar: View {
             Button("Open") { store.openPanel() }.buttonStyle(Chunky(height: 36, minWidth: 68))
             Button("Export Frame") { store.exportAll(selectedOnly: true) }
                 .buttonStyle(Chunky(height: 36, minWidth: 110))
+                .disabled(!store.canExport || store.current == nil)
+                .opacity(store.canExport && store.current != nil ? 1 : 0.5)
             Button("Export All") { store.exportAll() }
                 .buttonStyle(StartButton(height: 36, minWidth: 128))
+                .disabled(!store.canExport)
+                .opacity(store.canExport ? 1 : 0.5)
         }
         .padding(.horizontal, 8)
         .frame(height: 50)
@@ -684,14 +733,20 @@ private struct StatusStrip: View {
             // why this read +0.487 while the panel read +0.460 on the same frame.
             if let f = store.current { FrameChips(frame: f) }
             Chip(text: Paper.modelName)
-            Chip(text: "LCC: \(store.lccLabel)")
+            Chip(text: "Flat field: \(store.lccLabel)")
             Spacer()
             Chip(text: [store.wantTIFF ? "TIFF" : nil, store.wantJPEG ? "JPEG" : nil]
                     .compactMap { $0 }.joined(separator: " + ").isEmpty
                  ? "no format" : [store.wantTIFF ? "TIFF" : nil, store.wantJPEG ? "JPEG" : nil]
                     .compactMap { $0 }.joined(separator: " + "))
-            if !store.status.isEmpty {
-                Text(store.status).font(FUI.small()).foregroundStyle(.white.opacity(0.85))
+            if store.isProcessing {
+                Button("Cancel") { store.cancelProcessing() }
+                    .font(FUI.small(true))
+                    .buttonStyle(.bordered)
+                    .help("Cancel the current processing job")
+            }
+            if !store.displayedStatus.isEmpty {
+                Text(store.displayedStatus).font(FUI.small()).foregroundStyle(.white.opacity(0.85))
             }
         }
         .padding(.horizontal, 8)

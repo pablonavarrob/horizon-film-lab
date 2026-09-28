@@ -1,4 +1,5 @@
 import Accelerate
+import Darwin
 import Foundation
 import ImageIO
 import UniformTypeIdentifiers
@@ -54,15 +55,25 @@ enum Invert {
 
         var keyed: [String: [Int: URL]] = [:]
         var ok = true
+        var sawSuffix = false
         for f in files {
             let stem = f.deletingPathExtension().lastPathComponent
             let r = NSRange(stem.startIndex..., in: stem)
             guard let m = channelSuffix.firstMatch(in: stem, range: r),
-                  let g = Range(m.range(at: 1), in: stem) else { ok = false; break }
+                  let g = Range(m.range(at: 1), in: stem) else { ok = false; continue }
+            sawSuffix = true
             let token = stem[g].lowercased()
             let idx = ["r": 0, "g": 1, "b": 2, "1": 0, "2": 1, "3": 2][token]!
             let key = String(stem[stem.startIndex..<Range(m.range, in: stem)!.lowerBound])
+            if keyed[key]?[idx] != nil {
+                groupIssue = "duplicate \(["R", "G", "B"][idx]) capture for \(key)"
+                return []
+            }
             keyed[key, default: [:]][idx] = f
+        }
+        if sawSuffix && !ok {
+            groupIssue = "mixed channel-labelled and unlabelled captures"
+            return []
         }
         if ok, !keyed.isEmpty {
             let complete = keyed.filter { Set($0.value.keys) == Set([0, 1, 2]) }
@@ -91,6 +102,7 @@ enum Invert {
     /// Raw 16-bit planes straight off disk. No colour management: these are
     /// sensor counts, and a CGContext would transfer-function them.
     static func planes(_ url: URL) throws -> (p: [[Float]], w: Int, h: Int) {
+        if CaptureDecoder.isRAW(url) { return try CaptureDecoder.planes(url) }
         guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
               let img = CGImageSourceCreateImageAtIndex(src, 0, nil),
               let data = img.dataProvider?.data as Data? else {
@@ -166,7 +178,9 @@ enum Invert {
     }
 
     /// One frame as three density-ready count planes, following the layout.
-    static func frame(_ urls: [URL], layout: Layout) throws -> (p: [[Float]], w: Int, h: Int) {
+    static func frame(_ urls: [URL], layout: Layout,
+                      cancellation: (() -> Bool)? = nil) throws -> (p: [[Float]], w: Int, h: Int) {
+        if cancellation?() == true { throw Err("inversion cancelled") }
         if urls.count == 1 {
             let (p, w, h) = try planes(urls[0])
             if layout == .mono1 || p.count == 1 {
@@ -181,6 +195,7 @@ enum Invert {
         var out: [[Float]] = []
         var W = 0, H = 0
         for (i, u) in urls.enumerated() {
+            if cancellation?() == true { throw Err("inversion cancelled") }
             let (p, w, h) = try planes(u)
             if i == 0 { W = w; H = h } else if w != W || h != H {
                 throw Err("captures differ in size")
@@ -310,6 +325,7 @@ enum Invert {
 
     /// Pixel dimensions from the header, without decoding the image.
     static func imageSize(_ url: URL) -> (w: Int, h: Int)? {
+        if CaptureDecoder.isRAW(url) { return CaptureDecoder.imageSize(url) }
         guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
               let d = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
               let w = d[kCGImagePropertyPixelWidth] as? Int,
@@ -1195,6 +1211,9 @@ enum Invert {
     }
 
     static func writeMaster(_ rgb: [UInt16], w: Int, h: Int, to url: URL) throws {
+        let temporary = url.deletingLastPathComponent()
+            .appendingPathComponent(".\(UUID().uuidString).writing.tif")
+        defer { try? FileManager.default.removeItem(at: temporary) }
         let cs = CGColorSpace(name: CGColorSpace.sRGB)!   // tag only; data is density
         let bytes = rgb.withUnsafeBufferPointer { Data(buffer: $0) }
         guard let provider = CGDataProvider(data: bytes as CFData),
@@ -1204,7 +1223,7 @@ enum Invert {
                                     .union(.byteOrder16Little),
                                 provider: provider, decode: nil,
                                 shouldInterpolate: false, intent: .defaultIntent),
-              let dest = CGImageDestinationCreateWithURL(url as CFURL,
+              let dest = CGImageDestinationCreateWithURL(temporary as CFURL,
                             UTType.tiff.identifier as CFString, 1, nil)
         else { throw Err("cannot write \(url.lastPathComponent)") }
         // Uncompressed, deliberately. Cineon log is high-entropy so deflate
@@ -1216,6 +1235,11 @@ enum Invert {
         ] as CFDictionary)
         guard CGImageDestinationFinalize(dest) else {
             throw Err("cannot finalise \(url.lastPathComponent)")
+        }
+        // POSIX rename replaces an existing master in one filesystem operation.
+        // A crash never leaves a half-written file with the committed name.
+        guard rename(temporary.path, url.path) == 0 else {
+            throw Err("cannot commit \(url.lastPathComponent): \(String(cString: strerror(errno)))")
         }
     }
 }
@@ -1231,27 +1255,50 @@ extension Invert {
     /// no amount of inference here can be trusted. The operator picks; this only
     /// seeds the popup, and only where the evidence is actually conclusive:
     ///
-    ///  - count not divisible by 3   -> single shot, certain (cannot be triples)
+    ///  - complete named R/G/B or 1/2/3 groups -> three-shot
     ///  - single-channel files       -> the mono variant, and B&W by default:
     ///                                  one panchromatic plane carries no colour
-    ///  - otherwise                  -> 3-shot, the stated default, because most
-    ///                                  rigs shoot R,G,B in name order
+    ///  - otherwise                  -> single-shot. Capture count alone cannot
+    ///                                  distinguish an RGB roll from an ordered rig.
     ///
-    /// A channel suffix is NOT consulted here. It would be conclusive evidence of
-    /// a 3-shot set, but the default is already 3-shot at every count where the
-    /// question arises, so testing for it changed no answer.
+    /// A complete named channel set is the only automatic three-shot suggestion;
+    /// ordered unnamed triples remain available through the import choice.
     static func suggestLayout(_ urls: [URL]) -> (layout: Layout, monochrome: Bool)? {
         guard let mono = monoCaptures(urls) else { return nil }
-        // A count that does not divide by three CANNOT be triples.
-        let r = layoutAndFilm(threeShot: urls.count % 3 == 0, mono: mono)
+        let r = layoutAndFilm(threeShot: hasCompleteChannelGroups(urls), mono: mono)
         return (r.layout, r.monochrome)
+    }
+
+    /// A pure suggestion check; unlike `group`, it never accepts unnamed
+    /// alphanumeric triples or changes grouping diagnostics.
+    static func hasCompleteChannelGroups(_ urls: [URL]) -> Bool {
+        guard !urls.isEmpty, urls.count % 3 == 0 else { return false }
+        var keys: [String: Set<Int>] = [:]
+        for url in urls {
+            let stem = url.deletingPathExtension().lastPathComponent
+            guard let match = channelSuffix.firstMatch(
+                    in: stem, range: NSRange(stem.startIndex..., in: stem)),
+                  let tokenRange = Range(match.range(at: 1), in: stem),
+                  let suffixRange = Range(match.range, in: stem) else { return false }
+            let token = stem[tokenRange].lowercased()
+            guard let channel = ["r": 0, "g": 1, "b": 2,
+                                 "1": 0, "2": 1, "3": 2][token] else { return false }
+            let key = String(stem[..<suffixRange.lowerBound]).lowercased()
+            guard keys[key, default: []].insert(channel).inserted else { return false }
+        }
+        return keys.count * 3 == urls.count
+            && keys.values.allSatisfy { $0 == Set([0, 1, 2]) }
     }
 
     /// Is each capture a single channel? A FACT about the files, so the import
     /// picker does not ask it -- it reads it. This is why there are four layouts
     /// but only one question.
     static func monoCaptures(_ urls: [URL]) -> Bool? {
-        guard let first = urls.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }).first,
+        guard let first = urls.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }).first else {
+            return nil
+        }
+        if CaptureDecoder.isRAW(first) { return false }
+        guard
               let src = CGImageSourceCreateWithURL(first as CFURL, nil),
               let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else { return nil }
         return img.bitsPerPixel / max(img.bitsPerComponent, 1) < 3
@@ -1280,6 +1327,13 @@ extension Invert {
         /// shifts between captures, so one rectangle per roll is not enough --
         /// and this is a MASK for statistics, never a crop.
         var frameBorders: [String: Border] = [:]
+        /// Beta: supplemental statistics geometry for uncertain frames. Pixels
+        /// remain untouched; film-base estimation retains the ordinary border.
+        var carrierBorders: [String: Border] = [:]
+        var carrierMaskEnabled = false
+        /// A requested change awaiting full re-inversion. The applied flag
+        /// continues to describe the current saved cache until that completes.
+        var pendingCarrierMaskEnabled: Bool? = nil
         var perFrameBase = true
         var useBorder = true
         /// DEV-MONO. A render property, recorded here because it belongs to the
@@ -1287,10 +1341,16 @@ extension Invert {
         var monochrome = false
 
         init(layout: String = "rgb3", lcc: [String] = [],
-             frameBorders: [String: Border] = [:], perFrameBase: Bool = true,
+             frameBorders: [String: Border] = [:],
+             carrierBorders: [String: Border] = [:], carrierMaskEnabled: Bool = false,
+             pendingCarrierMaskEnabled: Bool? = nil,
+             perFrameBase: Bool = true,
              useBorder: Bool = true, monochrome: Bool = false) {
             self.layout = layout; self.lcc = lcc
             self.frameBorders = frameBorders; self.perFrameBase = perFrameBase
+            self.carrierBorders = carrierBorders
+            self.carrierMaskEnabled = carrierMaskEnabled
+            self.pendingCarrierMaskEnabled = pendingCarrierMaskEnabled
             self.useBorder = useBorder; self.monochrome = monochrome
         }
 
@@ -1312,6 +1372,12 @@ extension Invert {
             lcc = try c.decodeIfPresent([String].self, forKey: .lcc) ?? []
             frameBorders = try c.decodeIfPresent([String: Border].self,
                                                  forKey: .frameBorders) ?? [:]
+            carrierBorders = try c.decodeIfPresent([String: Border].self,
+                                                   forKey: .carrierBorders) ?? [:]
+            carrierMaskEnabled = try c.decodeIfPresent(Bool.self,
+                                                       forKey: .carrierMaskEnabled) ?? false
+            pendingCarrierMaskEnabled = try c.decodeIfPresent(Bool.self,
+                                                              forKey: .pendingCarrierMaskEnabled)
             perFrameBase = try c.decodeIfPresent(Bool.self, forKey: .perFrameBase) ?? true
             useBorder = try c.decodeIfPresent(Bool.self, forKey: .useBorder) ?? true
             monochrome = try c.decodeIfPresent(Bool.self, forKey: .monochrome) ?? false
@@ -1325,20 +1391,244 @@ extension Invert {
         out.deletingLastPathComponent().appendingPathComponent("session.json")
     }
 
+    static func captureStem(_ group: [URL]) -> String {
+        var stem = group[0].deletingPathExtension().lastPathComponent
+        // A numeric suffix also occurs on ordinary single-shot captures.
+        if group.count == 3,
+           let m = channelSuffix.firstMatch(in: stem,
+                range: NSRange(stem.startIndex..., in: stem)),
+           let r = Range(m.range, in: stem) { stem.removeSubrange(r) }
+        return stem
+    }
+
     static func loadSession(beside out: URL) -> Session? {
         guard let d = try? Data(contentsOf: sessionURL(beside: out)) else { return nil }
         return try? JSONDecoder().decode(Session.self, from: d)
     }
 
+    /// Beta analysis on an existing cache. Decode each source once, take only a
+    /// 256px density sample, and persist supplemental statistics masks. Masters
+    /// are neither read nor changed. Call on a background queue with exclusive
+    /// ownership of session.json; the app should suspend other session writes.
+    @discardableResult
+    static func analyzeCarrier(dir: URL, layout: Layout, out: URL,
+                               persist: Bool = true,
+                               cancellation: (() -> Bool)? = nil,
+                               progress: ((String) -> Void)? = nil) throws -> [String: Border] {
+        guard var session = loadSession(beside: out) else {
+            throw Err("cannot analyze carrier before this roll is inverted")
+        }
+        let files = try FileManager.default.contentsOfDirectory(at: dir,
+                              includingPropertiesForKeys: nil)
+            .filter { CaptureDecoder.isSupported($0) && !isLCC($0) }
+        let groups = group(files, layout: layout)
+        guard !groups.isEmpty else { throw Err(groupIssue ?? "no captures to analyze") }
+        if cancellation?() == true { throw Err("carrier analysis cancelled") }
+        let flatFiles = session.lcc.map { URL(fileURLWithPath: $0) }
+        var flatGroups = group(flatFiles, layout: layout)
+        if flatGroups.isEmpty, !flatFiles.isEmpty { flatGroups = flatFiles.map { [$0] } }
+        let flat = try loadLCC(flatGroups, layout: layout)
+        var fittedFlats: [String: [[Float]]] = [:]
+        var samples: [String: CarrierMask.Sample] = [:]
+        for (index, group) in groups.enumerated() {
+            if cancellation?() == true { throw Err("carrier analysis cancelled") }
+            let stem = captureStem(group)
+            var (p, w, h) = try frame(group, layout: layout,
+                                      cancellation: cancellation)
+            var response: [[Float]]? = nil
+            if let flat {
+                let key = "\(w)x\(h)"
+                if fittedFlats[key] == nil {
+                    if flat.w == w, flat.h == h {
+                        fittedFlats[key] = flat.p
+                    } else {
+                        let aFlat = Double(flat.w) / Double(flat.h)
+                        let aCap = Double(w) / Double(h)
+                        guard abs(aFlat - aCap) <= 0.01 * aCap else {
+                            throw Err("flat-field aspect differs from carrier capture")
+                        }
+                        fittedFlats[key] = rescale(flat.p, fromW: flat.w, fromH: flat.h,
+                                                  toW: w, toH: h)
+                    }
+                }
+                response = fittedFlats[key]
+            }
+            densityInPlace(&p, dark: nil, response: response)
+            samples[stem] = CarrierMask.sample(p, w: w, h: h)
+            progress?("carrier analysis \(index + 1)/\(groups.count)")
+        }
+        guard samples.count == groups.count else {
+            throw Err("capture names produce duplicate carrier samples")
+        }
+        if cancellation?() == true { throw Err("carrier analysis cancelled") }
+        let result = CarrierMask.borders(samples: samples, detected: session.frameBorders)
+        if !persist { return result }
+        session.carrierBorders = result
+        session.carrierMaskEnabled = true
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(session).write(to: sessionURL(beside: out), options: .atomic)
+        return result
+    }
+
+    /// Re-read the saved roll recipe and render inspection PNGs. This runs the
+    /// existing edge detector and Beta consensus without changing either one or
+    /// writing a session, master, or manifest. `destination` is a parent folder;
+    /// one uniquely named child is removed on any failure or cancellation.
+    static func writeBorderDiagnostics(dir: URL, layout: Layout, out: URL,
+                                       destination: URL,
+                                       cancellation: (() -> Bool)? = nil,
+                                       progress: ((String) -> Void)? = nil)
+        throws -> CarrierDiagnostics.Report {
+        guard CacheManifest.status(captures: dir, cache: out) == .complete,
+              let manifest = CacheManifest.read(cache: out) else {
+            throw Err("border diagnostics need a complete, current inverted cache")
+        }
+        let sessionPath = sessionURL(beside: out)
+        let sessionBytes = try Data(contentsOf: sessionPath)
+        let session = try JSONDecoder().decode(Session.self, from: sessionBytes)
+        guard session.layout == layout.rawValue, manifest.layout == layout.rawValue else {
+            throw Err("capture layout differs from the saved inversion recipe")
+        }
+        let sources = try FileManager.default.contentsOfDirectory(at: dir,
+            includingPropertiesForKeys: nil).filter(CaptureDecoder.isSupported)
+        let groups = group(sources.filter { !isLCC($0) }, layout: layout)
+        guard !groups.isEmpty else { throw Err(groupIssue ?? "no captures to diagnose") }
+        let names = groups.map(captureStem)
+        guard Set(names) == Set(manifest.expected), names.count == manifest.expected.count else {
+            throw Err("capture grouping differs from the saved cache recipe")
+        }
+        if cancellation?() == true { throw Err("border diagnostics cancelled") }
+
+        // Use only the flat-field captures actually recorded as applied by the
+        // inverter. A skipped flat is deliberately absent from Session.lcc.
+        let flats = session.lcc.map { URL(fileURLWithPath: $0) }
+        var flatGroups = group(flats, layout: layout)
+        if flatGroups.isEmpty, !flats.isEmpty { flatGroups = flats.map { [$0] } }
+        let flat = try loadLCC(flatGroups, layout: layout)
+        var fittedFlats: [String: [[Float]]] = [:]
+        var samples: [String: CarrierMask.Sample] = [:]
+        var ordinary: [String: Border] = [:]
+        for (index, captures) in groups.enumerated() {
+            if cancellation?() == true { throw Err("border diagnostics cancelled") }
+            let stem = names[index]
+            var (densityPlanes, w, h) = try frame(captures, layout: layout,
+                                                   cancellation: cancellation)
+            var response: [[Float]]? = nil
+            if let flat {
+                let size = "\(w)x\(h)"
+                if fittedFlats[size] == nil {
+                    if flat.w == w, flat.h == h {
+                        fittedFlats[size] = flat.p
+                    } else {
+                        let flatAspect = Double(flat.w) / Double(flat.h)
+                        let sourceAspect = Double(w) / Double(h)
+                        guard abs(flatAspect - sourceAspect) <= 0.01 * sourceAspect else {
+                            throw Err("saved flat-field aspect differs from the captures")
+                        }
+                        fittedFlats[size] = rescale(flat.p, fromW: flat.w, fromH: flat.h,
+                                                   toW: w, toH: h)
+                    }
+                }
+                response = fittedFlats[size]
+            }
+            densityInPlace(&densityPlanes, dark: nil, response: response)
+            ordinary[stem] = session.useBorder
+                ? detectEdges(densityPlanes, w: w, h: h) : Border()
+            samples[stem] = CarrierMask.sample(densityPlanes, w: w, h: h)
+            progress?("analysing borders \(index + 1)/\(groups.count)")
+        }
+        guard samples.count == groups.count else {
+            throw Err("capture names produce duplicate diagnostic samples")
+        }
+        let candidates = CarrierMask.borders(samples: samples, detected: ordinary)
+        if cancellation?() == true { throw Err("border diagnostics cancelled") }
+        guard try Data(contentsOf: sessionPath) == sessionBytes,
+              CacheManifest.status(captures: dir, cache: out) == .complete else {
+            throw Err("roll changed during border analysis; run diagnostics again")
+        }
+
+        let applicability: String
+        if let pending = session.pendingCarrierMaskEnabled {
+            applicability = "PREVIEW ONLY · Carrier mask requested \(pending ? "on" : "off"); full roll re-inversion required"
+        } else if session.carrierMaskEnabled {
+            applicability = "Beta analysis is applied to the saved cache · fresh evidence shown"
+        } else {
+            applicability = "PREVIEW ONLY · Carrier mask is off for the saved cache"
+        }
+        let sizeGroups = Dictionary(grouping: names) { name in
+            let sample = samples[name]!
+            return "\(sample.w)x\(sample.h)"
+        }
+        let orderedGroups = sizeGroups.values.map { $0.sorted() }
+            .sorted { ($0.first ?? "") < ($1.first ?? "") }
+
+        try FileManager.default.createDirectory(at: destination,
+                                                withIntermediateDirectories: true)
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        let folder = destination.appendingPathComponent(
+            "border-debug-\(formatter.string(from: Date()))-\(UUID().uuidString.prefix(8))",
+            isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        var finished = false
+        defer { if !finished { try? FileManager.default.removeItem(at: folder) } }
+        var products: [URL] = []
+        for (index, members) in orderedGroups.enumerated() {
+            if cancellation?() == true { throw Err("border diagnostics cancelled") }
+            let url = folder.appendingPathComponent(
+                String(format: "pooled-%03d.png", index + 1))
+            try CarrierDiagnostics.overview(names: members, samples: samples,
+                                            ordinary: ordinary, candidates: candidates,
+                                            applicability: applicability, to: url)
+            products.append(url)
+            progress?("writing pooled border image \(index + 1)/\(orderedGroups.count)")
+        }
+        for (index, stem) in names.enumerated() {
+            if cancellation?() == true { throw Err("border diagnostics cancelled") }
+            guard let sample = samples[stem] else { continue }
+            let safe = String(stem.replacingOccurrences(
+                of: "[^A-Za-z0-9_-]+", with: "-", options: .regularExpression).prefix(56))
+            let url = folder.appendingPathComponent(
+                String(format: "frame-%03d-%@.png", index + 1, safe.isEmpty ? "capture" : safe))
+            let frame = CarrierDiagnostics.Frame(name: stem, sample: sample,
+                ordinary: ordinary[stem] ?? Border(),
+                candidate: candidates[stem] ?? Border(),
+                applied: session.carrierMaskEnabled
+                    ? (session.carrierBorders[stem] ?? Border()) : Border())
+            try CarrierDiagnostics.frame(frame, applicability: applicability, to: url)
+            products.append(url)
+            progress?("writing frame border image \(index + 1)/\(names.count)")
+        }
+        if cancellation?() == true { throw Err("border diagnostics cancelled") }
+        guard try Data(contentsOf: sessionPath) == sessionBytes,
+              CacheManifest.status(captures: dir, cache: out) == .complete else {
+            throw Err("roll changed while writing diagnostics; run again")
+        }
+        let preview = products[0]
+        let candidateCount = candidates.count
+        let evidence = candidateCount == 0
+            ? "No additional opaque carrier met Beta consensus."
+            : "Beta proposes supplemental statistics masks on \(candidateCount) of \(names.count) frame(s)."
+        let summary = "\(names.count) frame(s), \(orderedGroups.count) capture size group(s). "
+            + "\(evidence) \(applicability). The cyan ordinary detector and orange Beta candidate "
+            + "exclude measurements only; no source pixels are cropped."
+        finished = true
+        return CarrierDiagnostics.Report(preview: preview, files: products, summary: summary)
+    }
+
     static func run(dir: URL, layout: Layout, perFrameBase: Bool, out: URL,
-                    only: Set<String>? = nil, useBorder: Bool = true,
+                    only: Set<String>? = nil, forceRebuild: Bool = false,
+                    useBorder: Bool = true,
                     lcc: [URL]? = nil, debugBorder: Bool = false,
                     monochrome: Bool = false,
+                    carrierMaskEnabled carrierMaskOverride: Bool? = nil,
+                    cancellation: (() -> Bool)? = nil,
                     progress: ((String) -> Void)? = nil) throws {
-        let exts: Set<String> = ["tif", "tiff", "png"]
         let all = (try FileManager.default.contentsOfDirectory(at: dir,
                     includingPropertiesForKeys: nil))
-            .filter { exts.contains($0.pathExtension.lowercased()) }
+            .filter(CaptureDecoder.isSupported)
         // An LCC chosen in Settings wins; otherwise fall back to captures in
         // this folder whose name marks them as a flat.
         let lccFiles = (lcc?.isEmpty == false) ? lcc! : all.filter(isLCC)
@@ -1348,6 +1638,95 @@ extension Invert {
             throw Err(groupIssue ?? "no captures in \(dir.lastPathComponent)")
         }
         try FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
+        let allJobs = frames.map { (g: $0, stem: captureStem($0)) }
+        let stems = allJobs.map(\.stem)
+        let comparableStems = stems.map {
+            $0.precomposedStringWithCanonicalMapping.folding(
+                options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+        }
+        guard !stems.contains(where: \.isEmpty),
+              Set(comparableStems).count == stems.count else {
+            throw Err("capture names produce duplicate cache masters; rename the captures")
+        }
+        if let only, !only.isSubset(of: Set(stems)) {
+            throw Err("requested frame is not in this roll")
+        }
+        let sourceStamp = try CacheManifest.stamp(all)
+        let externalLCC = lccFiles.filter {
+            !all.contains($0)
+        }
+        let lccStamp = try CacheManifest.stamp(externalLCC)
+        let settingsStamp = [layout.rawValue, String(perFrameBase), String(useBorder),
+                             lccStamp].joined(separator: "|")
+        let oldManifest = CacheManifest.read(cache: out)
+        let previousSession = loadSession(beside: out)
+        // New rolls start with the carrier mask on. Existing rolls retain their
+        // requested or applied choice, including when the whole roll is rebuilt.
+        // A selected-frame run with a pending choice still hits the full-roll guard.
+        let carrierMaskEnabled = carrierMaskOverride
+            ?? previousSession?.pendingCarrierMaskEnabled
+            ?? previousSession?.carrierMaskEnabled ?? true
+        let carrierNeedsRebuild = previousSession?.pendingCarrierMaskEnabled != nil
+            || (previousSession.map { $0.carrierMaskEnabled != carrierMaskEnabled } ?? false)
+        if only != nil, carrierNeedsRebuild {
+            throw Err("carrier analysis requires re-inverting the whole roll before rebuilding one frame")
+        }
+        let rebuildAll = forceRebuild || carrierNeedsRebuild
+        let reusable = oldManifest?.version == CacheManifest.version
+            && oldManifest?.sourceStamp == sourceStamp
+            && oldManifest?.externalSourceStamp == lccStamp
+            && oldManifest?.settingsStamp == settingsStamp
+            && oldManifest?.layout == layout.rawValue
+            && oldManifest?.perFrameBase == perFrameBase
+            && oldManifest?.useBorder == useBorder
+            && Set(oldManifest?.expected ?? []) == Set(stems)
+        var manifest = reusable ? oldManifest!
+            : CacheManifest(sourceStamp: sourceStamp, settingsStamp: settingsStamp,
+                            layout: layout.rawValue, perFrameBase: perFrameBase,
+                            useBorder: useBorder,
+                            externalSources: externalLCC.map(\.path),
+                            externalSourceStamp: lccStamp,
+                            expected: stems, completed: [])
+        if !reusable { try manifest.write(cache: out) }
+        let completed = previousSession != nil ? Set(manifest.completed) : []
+        func validMaster(_ job: (g: [URL], stem: String)) -> Bool {
+            let master = out.appendingPathComponent(job.stem + ".ntg.tif")
+            guard let sourceSize = imageSize(job.g[0]),
+                  let masterSize = imageSize(master) else { return false }
+            return sourceSize.w == masterSize.w && sourceSize.h == masterSize.h
+        }
+        // A changed source or recipe requires a coherent full rebuild even if
+        // the caller asked for one frame. Otherwise old and new masters mix.
+        let effectiveOnly = reusable && !rebuildAll ? only : nil
+        let jobs = allJobs.filter { job in
+            guard effectiveOnly == nil || effectiveOnly!.contains(job.stem) else { return false }
+            return rebuildAll || effectiveOnly != nil
+                || !completed.contains(job.stem) || !validMaster(job)
+        }
+        if jobs.isEmpty {
+            if var session = loadSession(beside: out),
+               session.carrierMaskEnabled != carrierMaskEnabled
+                || session.monochrome != monochrome {
+                session.carrierMaskEnabled = carrierMaskEnabled
+                session.monochrome = monochrome
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+                try encoder.encode(session).write(to: sessionURL(beside: out), options: .atomic)
+            }
+            if !manifest.finalized, previousSession != nil {
+                manifest.finalized = true
+                try manifest.write(cache: out)
+            }
+            progress?("cache complete: \(stems.count) frame(s)")
+            return
+        }
+        // A requested replacement is incomplete from this point until its new
+        // master, border, and manifest have all committed.
+        let pending = Set(jobs.map(\.stem))
+        manifest.completed.removeAll { pending.contains($0) }
+        manifest.finalized = false
+        try manifest.write(cache: out)
+        if cancellation?() == true { throw Err("inversion cancelled") }
         // Say how they were grouped, not just how many. On a wrong capture mode
         // the frame count is a third of the capture count, which is instantly
         // visible; a stderr warning was not.
@@ -1430,7 +1809,9 @@ extension Invert {
                                                  / Double(n - 1)).rounded()) }
         var bases: [[Double]] = []
         for i in idx {
-            let (p0, w0, h0) = try frame(frames[i], layout: layout)
+            if cancellation?() == true { throw Err("inversion cancelled") }
+            let (p0, w0, h0) = try frame(frames[i], layout: layout,
+                                         cancellation: cancellation)
             // Last-resort check: the flat divides the frame pixel for pixel, so a
             // surviving mismatch would be an out-of-bounds read. The rescale above
             // should make this unreachable.
@@ -1471,22 +1852,12 @@ extension Invert {
         // (Cmd-R, or --only) deleted the other 32 of 33 -- and a frame with no
         // rectangle has no statistics mask, so its levels are then measured over
         // the rebate and its colour changes. Silent, and only visible on reopen.
-        var frameBorders = loadSession(beside: out)?.frameBorders ?? [:]
+        var frameBorders = reusable ? (previousSession?.frameBorders ?? [:]) : [:]
+        var carrierBorders = reusable ? (previousSession?.carrierBorders ?? [:]) : [:]
         let rollBase = (0..<3).map { c in median(bases.map { Float($0[c]) }) }
         print(String(format: "roll film base: R=%.4f G=%.4f B=%.4f", rollBase[0], rollBase[1], rollBase[2]))
 
         // --- encode ----------------------------------------------------------
-        // Resolve the stems up front. This was computed twice per frame with
-        // byte-identical code, the first result thrown away.
-        func stemOf(_ g: [URL]) -> String {
-            var stem = g[0].deletingPathExtension().lastPathComponent
-            if let m = channelSuffix.firstMatch(in: stem,
-                    range: NSRange(stem.startIndex..., in: stem)),
-               let r = Range(m.range, in: stem) { stem.removeSubrange(r) }
-            return stem
-        }
-        let jobs = frames.map { (g: $0, stem: stemOf($0)) }
-            .filter { only == nil || only!.contains($0.stem) }
 
         // One frame per worker. The per-frame work is fully independent once the
         // border and roll base are known, and the machine was sitting at 82% of
@@ -1503,9 +1874,18 @@ extension Invert {
         // memory-bandwidth and disk bound, not compute bound: 2.1 GB of captures
         // in and 2.1 GB of masters out. Also still capped by installed RAM, since
         // each lane holds ~700 MB live.
-        let perFrame = 800 << 20
+        let hasRAW = jobs.contains { job in job.g.contains(where: CaptureDecoder.isRAW) }
+        let largestPixels = jobs.compactMap { imageSize($0.g[0]) }.map { $0.w * $0.h }.max() ?? 0
+        // RAW decoding briefly holds Core Image's demosaic buffers, an RGBAf
+        // bitmap, and the three planar floats at once. Budget from dimensions
+        // rather than using the TIFF-only 800 MB estimate for every capture.
+        let estimated = hasRAW
+            ? largestPixels * 48 + (256 << 20)
+            : largestPixels * 28 + (128 << 20)
+        let perFrame = max(800 << 20, estimated)
         let lanes = max(1, min(jobs.count,
-                               min(4, Int(ProcessInfo.processInfo.physicalMemory / 3) / perFrame)))
+                               min(hasRAW ? 2 : 4,
+                                   Int(ProcessInfo.processInfo.physicalMemory / 3) / perFrame)))
         let lanesEnv = ProcessInfo.processInfo.environment["HORIZON_LANES"].flatMap { Int($0) }
         let lanes2 = max(1, min(jobs.count, lanesEnv ?? lanes))
         print("encoding \(jobs.count) frame(s), \(lanes2) at a time")
@@ -1513,16 +1893,32 @@ extension Invert {
         var tLoad = 0.0, tDens = 0.0, tEnc = 0.0, tWrite = 0.0
         var done = 0
         var failure: Error?
+        var carrierSamples: [String: CarrierMask.Sample] = [:]
+        var session = previousSession ?? Session()
+        session.layout = layout.rawValue
+        session.lcc = response != nil ? lccFiles.map(\.path) : []
+        session.perFrameBase = perFrameBase
+        session.useBorder = useBorder
+        session.monochrome = monochrome
+        session.frameBorders = frameBorders
+        session.carrierBorders = carrierBorders
+        // Retain the applied setting until the whole roll commits successfully.
+        session.carrierMaskEnabled = previousSession?.carrierMaskEnabled ?? false
+        session.pendingCarrierMaskEnabled = carrierNeedsRebuild || carrierMaskEnabled
+            ? carrierMaskEnabled : nil
+        let sessionEncoder = JSONEncoder()
+        sessionEncoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         DispatchQueue.concurrentPerform(iterations: lanes2) { lane in
             var i = lane
             while i < jobs.count {
                 defer { i += lanes2 }
-                lock.lock(); let stop = failure != nil; lock.unlock()
+                lock.lock(); let stop = failure != nil || cancellation?() == true; lock.unlock()
                 if stop { return }
                 let (g, stem) = jobs[i]
                 var t = Date()
                 do {
-                    var (p, w, h) = try frame(g, layout: layout)
+                    var (p, w, h) = try frame(g, layout: layout,
+                                              cancellation: cancellation)
                     let tL = -t.timeIntervalSinceNow; t = Date()
                     // p becomes D in place: the two are the same buffer from here.
                     densityInPlace(&p, dark: nil, response: response)
@@ -1533,6 +1929,8 @@ extension Invert {
                     // frame of this roll (median 978 against a truth of 0-394,
                     // because the per-edge medians came from different frames).
                     let fb = useBorder ? detectEdges(p, w: w, h: h) : Border()
+                    let carrierSample = carrierMaskEnabled
+                        ? CarrierMask.sample(p, w: w, h: h) : nil
                     let base = perFrameBase
                         ? (estimateBase(p, w: w, h: h, border: fb, clipAt: clipAt)
                            ?? estimateBase(p, floor: floor))
@@ -1555,13 +1953,21 @@ extension Invert {
                                     to: out.appendingPathComponent(stem + ".ntg.tif"))
                     let tW = -t.timeIntervalSinceNow
                     lock.lock()
-                    tLoad += tL; tDens += tD; tEnc += tE; tWrite += tW
-                    frameBorders[stem] = fb
-                    done += 1
-                    print("    \(stem)  L\(fb.left) T\(fb.top) R\(fb.right) B\(fb.bottom)")
-                    print("  \(stem)  base [\(base.map { String(format: "%.3f", $0) }.joined(separator: " "))]")
-                    progress?("inverting \(done)/\(jobs.count) — \(stem)")
-                    lock.unlock()
+                    do {
+                        defer { lock.unlock() }
+                        tLoad += tL; tDens += tD; tEnc += tE; tWrite += tW
+                        frameBorders[stem] = fb
+                        session.frameBorders = frameBorders
+                        try sessionEncoder.encode(session).write(to: sessionURL(beside: out),
+                                                                 options: .atomic)
+                        if let carrierSample { carrierSamples[stem] = carrierSample }
+                        if !manifest.completed.contains(stem) { manifest.completed.append(stem) }
+                        try manifest.write(cache: out)
+                        done += 1
+                        print("    \(stem)  L\(fb.left) T\(fb.top) R\(fb.right) B\(fb.bottom)")
+                        print("  \(stem)  base [\(base.map { String(format: "%.3f", $0) }.joined(separator: " "))]")
+                        progress?("inverting \(done)/\(jobs.count) — \(stem)")
+                    }
                 } catch {
                     lock.lock(); if failure == nil { failure = error }; lock.unlock()
                     return
@@ -1569,20 +1975,36 @@ extension Invert {
             }
         }
         if let failure { throw failure }
+        if cancellation?() == true { throw Err("inversion cancelled") }
 
         // Record what produced these masters.
-        let session = Session(layout: layout.rawValue,
-                              // Only what was ACTUALLY used. Yours recorded a flat
-                              // it had silently dropped, which is why the session
-                              // claimed an LCC while the frames had none.
-                              lcc: response != nil ? lccFiles.map(\.path) : [],
-                              frameBorders: frameBorders,
-                              perFrameBase: perFrameBase, useBorder: useBorder,
-                              monochrome: monochrome)
-        let enc = JSONEncoder(); enc.outputFormatting = [.prettyPrinted, .sortedKeys]
-        if let d = try? enc.encode(session) {
-            try? d.write(to: sessionURL(beside: out))
+        if carrierMaskEnabled {
+            if jobs.count == allJobs.count {
+                carrierBorders = CarrierMask.borders(samples: carrierSamples,
+                                                      detected: frameBorders)
+                session.carrierBorders = carrierBorders
+            } else {
+                // The resumed job samples only newly encoded frames. Save its
+                // borders first, then scan the whole source roll for geometry.
+                try sessionEncoder.encode(session).write(to: sessionURL(beside: out),
+                                                         options: .atomic)
+                carrierBorders = try analyzeCarrier(dir: dir, layout: layout, out: out,
+                                                    persist: false,
+                                                    cancellation: cancellation,
+                                                    progress: progress)
+                session.carrierBorders = carrierBorders
+            }
         }
+        if cancellation?() == true { throw Err("inversion cancelled") }
+        manifest.finalized = Set(manifest.completed).isSuperset(of: Set(stems))
+        try manifest.write(cache: out)
+        if cancellation?() == true { throw Err("inversion cancelled") }
+        // Clear the pending setting last. A failed final write leaves the
+        // previous applied state and its pending request available for retry.
+        session.carrierMaskEnabled = carrierMaskEnabled
+        session.pendingCarrierMaskEnabled = nil
+        try sessionEncoder.encode(session).write(to: sessionURL(beside: out),
+                                                 options: .atomic)
         let n2 = Double(frames.count)
         print(String(format: "per frame: decode %.2fs  density+base %.2fs  encode %.2fs  write %.2fs",
                      tLoad / n2, tDens / n2, tEnc / n2, tWrite / n2))

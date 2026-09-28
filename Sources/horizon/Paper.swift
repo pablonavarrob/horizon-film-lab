@@ -203,16 +203,10 @@ enum Paper {
     // back, the honest route is a ratio-preserving roll-off (one compression factor
     // from the max channel, applied to all three) so the recovery cannot move hue.
 
-    // ============================== DEV-CURVE ==============================
-    // TO REMOVE: this block, `newCurve`, `Master.Terminator.newCurve`, the
-    // `newCurve` parameter on `Master.toneSlopes`, the `|| term.newCurve` in
-    // `render16`'s shoulder argument, `RollStore.newCurve`, its Settings item in
-    // `main.swift`, `--new-curve` in `CLI.swift`, the second label set in
-    // `Contrast.grades`, and the `newCurve` axis of the `--check-grade` sweep.
-    // Then `gradationRange` goes back to a plain `(-3, 2)`.
-    //
+    // The shouldered curve is standard. Keep the old curve as an explicit mode
+    // for saved preferences and numerical comparisons.
     // THE THREE CONTROLS, SEPARATED. Highlight/Shadow trim a region, Contrast sets
-    // the curve, DRANGE recovers range -- and under this flag each does only its
+    // the curve, DRANGE recovers range -- and in the standard mode each does its
     // own job:
     //
     //  - the SHOULDER applies to every contrast path, not just DRANGE. That is the
@@ -223,7 +217,7 @@ enum Paper {
     //    at Normal contrast go 2.35% -> 0.00%.
     //  - CONTRAST gains a step at the top to pay for the shoulder's softness.
     //    Measured over three frames, contrast / crushed / blown:
-    //      today's Hard 2   200/215/61   0.75%   2.53%
+    //      legacy Hard 2    200/215/61   0.75%   2.53%
     //      shouldered +2    183/196/61   0.44%   0.08%
     //      shouldered +3    192/203/67   0.47%   0.15%   <- the new maximum
     //      shouldered +4    199/209/73   2.10%   2.33%   the ICC's toe gives way
@@ -236,10 +230,9 @@ enum Paper {
     // the Tone Adjustment grades bit-identical: the flattening near white is the
     // ICC's OWN shoulder, not ours. Deleting it would unbalance those controls for
     // a reason that was never true.
-    nonisolated(unsafe) static var newCurve = false
-    /// −3…+2 as shipped; −2…+3 under DEV-CURVE. Only ever widens at the top, and
-    /// saved edits top out at +2, so no stored value changes meaning.
-    static var gradationRange: (Int, Int) { newCurve ? (-2, 3) : (-3, 2) }
+    nonisolated(unsafe) static var newCurve = true
+    /// The shouldered curve adds a stronger step while preserving Soft 3.
+    static var gradationRange: (Int, Int) { newCurve ? (-3, 3) : (-3, 2) }
     // =======================================================================
 
     // ============================== DEV-DRANGE ==============================
@@ -379,11 +372,16 @@ enum Paper {
     /// Paper log exposure -> encoded output, one channel. The built-in RA-4
     /// terminator, and the only consumer of the published curve left.
     @inline(__always)
-    static func transfer(_ e: Double, channel c: Int) -> Double {
-        srgbEncode(pow(10.0, dMin - paperDensity(e, channel: c)))
+    static func transfer(_ e: Double, channel c: Int,
+                         crossoverHigh: Double = Paper.crossoverHigh,
+                         crossoverShadow: Double = Paper.crossoverShadow) -> Double {
+        srgbEncode(pow(10.0, dMin - paperDensity(e, channel: c,
+                                               crossoverHigh: crossoverHigh, crossoverShadow: crossoverShadow)))
     }
 
-    static func paperDensity(_ eWarped: Double, channel: Int) -> Double {
+    static func paperDensity(_ eWarped: Double, channel: Int,
+                             crossoverHigh: Double = Paper.crossoverHigh,
+                             crossoverShadow: Double = Paper.crossoverShadow) -> Double {
         // The crossover is a property of the PAPER, so it is a function of where
         // the tone LANDED and nothing else. Applied to the pre-paper value it
         // couples to the gradation slope and a contrast press visibly moves the

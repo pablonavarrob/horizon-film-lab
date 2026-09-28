@@ -112,7 +112,7 @@ struct Bevel: ViewModifier {
                 p.addLine(to: CGPoint(x: g.size.width, y: g.size.height))
                 p.addLine(to: CGPoint(x: 0, y: g.size.height))
             }.stroke(up ? FUI.shadowGrey : FUI.hiLight, lineWidth: width)
-        })
+        }.allowsHitTesting(false))
     }
 }
 

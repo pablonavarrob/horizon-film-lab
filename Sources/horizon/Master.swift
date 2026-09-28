@@ -55,6 +55,7 @@ struct Master: Sendable {
         // the destination space. Doing that read a median density of 0.073 where
         // the true value is 0.346 -- silently wrong, not obviously broken.
         let w = img.width, h = img.height
+        guard w > 0, h > 0 else { throw Err("empty image") }
         guard let cfData = img.dataProvider?.data else { throw Err("no pixel data") }
         let raw = cfData as Data
         let comps = img.bitsPerPixel / 16
@@ -68,11 +69,12 @@ struct Master: Sendable {
         var cx = 0, cy = 0, cw = w, ch = h
         if let crop, !crop.isEmpty {
             let tw = w - crop.left - crop.right, th = h - crop.top - crop.bottom
-            if tw > 16, th > 16, crop.left >= 0, crop.top >= 0, tw <= w, th <= h {
+            if tw > 16, th > 16, crop.left >= 0, crop.top >= 0,
+               crop.right >= 0, crop.bottom >= 0, tw <= w, th <= h {
                 cx = crop.left; cy = crop.top; cw = tw; ch = th
             }
         }
-        let f = maxEdge.map { max(1, (max(cw, ch) + $0 - 1) / $0) } ?? 1
+        let f = maxEdge.map { min(min(cw, ch), max(1, (max(cw, ch) + max($0, 1) - 1) / max($0, 1))) } ?? 1
         let (planes, pw, ph) = readPlanes(raw, w: w, rowBytes: rowBytes, comps: comps,
                                           bigEndian: bigEndian,
                                           cx: cx, cy: cy, cw: cw, ch: ch, factor: f)
@@ -85,9 +87,22 @@ struct Master: Sendable {
                                         right: frame.right / f, bottom: frame.bottom / f)
                          : frame
         }
+        let measurements: (lo: Double, hi: Double, latd: Double)
+        if crop != nil {
+            // Meter the identical uncropped preview grid, including its roll
+            // statistics mask. Output geometry must never change the grade.
+            let mf = min(min(w, h), max(1, (max(w, h) + FrameItem.previewEdge - 1) / FrameItem.previewEdge))
+            let (mp, mw, mh) = readPlanes(raw, w: w, rowBytes: rowBytes, comps: comps,
+                                          bigEndian: bigEndian, cx: 0, cy: 0,
+                                          cw: w, ch: h, factor: mf)
+            let mm = frame.map { Invert.Border(left: $0.left / mf, top: $0.top / mf,
+                                               right: $0.right / mf, bottom: $0.bottom / mf) }
+            measurements = measureEnds(mp, width: mw, height: mh, mask: mm)
+        } else {
+            measurements = measureEnds(planes, width: pw, height: ph, mask: mask)
+        }
         return Master(url: url, width: pw, height: ph, planes: planes,
-                      frameMask: mask,
-                      ends: measureEnds(planes, width: pw, height: ph, mask: mask))
+                      frameMask: mask, ends: measurements)
     }
 
     /// Deinterleave, crop and decimate in ONE parallel pass.
@@ -325,7 +340,7 @@ struct Master: Sendable {
         // WYSIWYG. Decimating here with the SAME factor and the same box mean
         // `Master.load` uses makes the two agree by construction rather than by
         // a tuned kernel: at or below preview size f is 1 and nothing changes.
-        let f = max(1, (max(width, height) + FrameItem.previewEdge - 1) / FrameItem.previewEdge)
+        let f = min(min(width, height), max(1, (max(width, height) + FrameItem.previewEdge - 1) / FrameItem.previewEdge))
         let src: [[UInt16]], w: Int, h: Int
         if f == 1 {
             src = planes; w = width; h = height
@@ -450,7 +465,7 @@ struct Master: Sendable {
         let ow = w / f, oh = h / f
         guard ow > 0, oh > 0 else { return (p, w, h) }
         var out = [[UInt16]](repeating: [UInt16](repeating: 0, count: ow * oh), count: 3)
-        let half = f * f / 2, area = f * f
+        let area = f * f
         for c in 0..<3 {
             p[c].withUnsafeBufferPointer { srcB in
                 let src = srcB.baseAddress!
@@ -464,7 +479,7 @@ struct Master: Sendable {
                                     let row = (oy * f + dy) * w + ox * f
                                     for dx in 0..<f { acc += Int(src[row + dx]) }
                                 }
-                                dst[oy * ow + ox] = UInt16((acc + half) / area)
+                                dst[oy * ow + ox] = UInt16(acc / area)
                             }
                         }
                     }
@@ -561,10 +576,13 @@ struct Master: Sendable {
     @inline(__always)
     static func curveValue(_ x: Double, lo: Double, hi: Double, gamma: Double,
                            aim: Double, slopes: (lo: Double, hi: Double),
-                           offset: Double, shoulder: Bool = false) -> Double {
+                           offset: Double, shoulder: Bool = false,
+                           kneeHigh: Double = Paper.kneeHigh,
+                           kneeLow: Double = Paper.kneeLow) -> Double {
         var v = min(max((x - lo) / max(hi - lo, 1e-4), 0), 1)
         if gamma != 1 { v = pow(v, gamma) }
-        v = tone(v, aim: aim, lo: slopes.lo, hi: slopes.hi, shoulder: shoulder)
+        v = tone(v, aim: aim, lo: slopes.lo, hi: slopes.hi, shoulder: shoulder,
+                 kneeHigh: kneeHigh, kneeLow: kneeLow)
         return min(max(v + offset, 0), 1)
     }
 
@@ -611,7 +629,9 @@ struct Master: Sendable {
     /// `Terminator.init` calls this to solve its own `aim`.
     static func outLinear(_ v: (Double, Double, Double),
                           icc: ICCOnly.Transform?, lut: PrintLUT?,
-                          span: Double)
+                          span: Double,
+                          crossoverHigh: Double = Paper.crossoverHigh,
+                          crossoverShadow: Double = Paper.crossoverShadow)
         -> (Double, Double, Double) {
         let r = Float(min(max(v.0, 0), 1))
         let g = Float(min(max(v.1, 0), 1))
@@ -622,9 +642,12 @@ struct Master: Sendable {
             let s = lut.sample(r, g, b)
             o = (PrintLUT.toSRGB(s.0), PrintLUT.toSRGB(s.1), PrintLUT.toSRGB(s.2))
         } else {
-            o = (Float(Paper.transfer(directExposure(Double(r), span: span), channel: 0)),
-                 Float(Paper.transfer(directExposure(Double(g), span: span), channel: 1)),
-                 Float(Paper.transfer(directExposure(Double(b), span: span), channel: 2)))
+            o = (Float(Paper.transfer(directExposure(Double(r), span: span), channel: 0,
+                                     crossoverHigh: crossoverHigh, crossoverShadow: crossoverShadow)),
+                 Float(Paper.transfer(directExposure(Double(g), span: span), channel: 1,
+                                     crossoverHigh: crossoverHigh, crossoverShadow: crossoverShadow)),
+                 Float(Paper.transfer(directExposure(Double(b), span: span), channel: 2,
+                                     crossoverHigh: crossoverHigh, crossoverShadow: crossoverShadow)))
         }
         return (Paper.srgbDecode(Double(o.0)), Paper.srgbDecode(Double(o.1)),
                 Paper.srgbDecode(Double(o.2)))
@@ -635,9 +658,11 @@ struct Master: Sendable {
     /// is loaded rather than hardcoded -- the ICC, a .cube and the RA-4 curve put
     /// the aim in three different places. Monotone in v for all three.
     static func aimValue(icc: ICCOnly.Transform?, lut: PrintLUT?,
-                         span: Double) -> Double {
+                         span: Double, crossoverHigh: Double = Paper.crossoverHigh,
+                         crossoverShadow: Double = Paper.crossoverShadow) -> Double {
         func lum(_ v: Double) -> Double {
-            let o = outLinear((v, v, v), icc: icc, lut: lut, span: span)
+            let o = outLinear((v, v, v), icc: icc, lut: lut, span: span,
+                              crossoverHigh: crossoverHigh, crossoverShadow: crossoverShadow)
             return Paper.lumaW.0 * o.0 + Paper.lumaW.1 * o.1 + Paper.lumaW.2 * o.2
         }
         var lo = 0.02, hi = 0.98
@@ -781,8 +806,9 @@ struct Master: Sendable {
     /// "+ Cyan / - Red" labelling on the panel.
     static func cmyOffsets(_ edit: Edit) -> (Double, Double, Double) {
         let u = cmyUnit
-        return (-Double(edit.cyan) * u, -Double(edit.magenta) * u,
-                -Double(edit.yellow) * u)
+        return (-(Double(edit.cyan) + edit.autoCyan) * u,
+                -(Double(edit.magenta) + edit.autoMagenta) * u,
+                -(Double(edit.yellow) + edit.autoYellow) * u)
     }
 
     /// The channel-common endpoints after the controls that shape TONE.
@@ -823,10 +849,10 @@ struct Master: Sendable {
     /// machine: `hi` acts above the aim, `lo` below it. Gradation Selection is the
     /// main gradation and moves both.
     static func toneSlopes(_ edit: Edit,
-                           newCurve: Bool = false) -> (lo: Double, hi: Double) {
-        let base = (1 + Paper.gradationStep * Double(min(max(edit.gradation,
-                                                        Paper.gradationRange.0),
-                                                    Paper.gradationRange.1)))
+                           newCurve: Bool = true) -> (lo: Double, hi: Double) {
+        // A saved Soft 3 retains its meaning across curve modes. Snapshot
+        // this choice instead of consulting a mutable app-wide range.
+        let base = 1 + Paper.gradationStep * Double(min(max(edit.gradation, -3), newCurve ? 3 : 2))
         func side(_ g: Paper.Grade) -> Double {
             max(base * (1 + directToneSlope * Paper.gradeAmount(g)), 0.05)
         }
@@ -835,7 +861,7 @@ struct Master: Sendable {
 
     /// A two-sided slope about the aim. Monotone, and it pins the aim exactly.
     ///
-    /// `shoulder` is DEV-DRANGE: instead of clamping at 0 and 1, roll off
+    /// `shoulder` rolls off asymptotically instead of clamping at 0 and 1,
     /// asymptotically outside a knee placed part-way from the aim to each end.
     /// The inner band is untouched, so the aim stays pinned however hard the slope
     /// is, and nothing ever reaches 0 or 1 -- which is the point. Paper never
@@ -843,11 +869,13 @@ struct Master: Sendable {
     /// through a softplus for the same reason.
     @inline(__always)
     static func tone(_ v: Double, aim: Double, lo kLo: Double, hi kHi: Double,
-                     shoulder: Bool = false) -> Double {
+                     shoulder: Bool = false,
+                     kneeHigh: Double = Paper.kneeHigh,
+                     kneeLow: Double = Paper.kneeLow) -> Double {
         let s = aim + (v - aim) * (v > aim ? kHi : kLo)
         guard shoulder else { return min(max(s, 0), 1) }
-        let hiK = aim + Paper.kneeHigh * (1 - aim)
-        let loK = aim - Paper.kneeLow * aim
+        let hiK = aim + kneeHigh * (1 - aim)
+        let loK = aim - kneeLow * aim
         if s > hiK, hiK < 1 { return hiK + (1 - hiK) * (1 - exp(-(s - hiK) / (1 - hiK))) }
         if s < loK, loK > 0 { return loK * exp((s - loK) / loK) }
         return min(max(s, 0), 1)
@@ -880,12 +908,16 @@ struct Master: Sendable {
         /// through the whole terminator, and `autoGamma` used to run it on every
         /// redraw to re-solve a number that only moves when the terminator does.
         let aim: Double
-        /// DEV-CURVE, snapshotted for the same reason as the rest.
+        /// Contrast curve mode, snapshotted for the same reason as the rest.
         let newCurve: Bool
         /// The built-in curve's span. Snapshotted because `aimValue` reads it and
         /// export renders detached -- the same ARC/staleness race the rest of this
         /// value exists to avoid.
         let span: Double
+        let kneeHigh: Double
+        let kneeLow: Double
+        let crossoverHigh: Double
+        let crossoverShadow: Double
 
         /// Does this terminator HARD-CLAMP at white?
         ///
@@ -901,10 +933,16 @@ struct Master: Sendable {
         var clampsHard: Bool { icc != nil || lut != nil }
 
         init(icc: ICCOnly.Transform?, lut: PrintLUT?, mono: Bool,
-             newCurve: Bool = false, span: Double = Paper.directSpan) {
+             newCurve: Bool = true, span: Double = Paper.directSpan,
+             kneeHigh: Double = Paper.kneeHigh, kneeLow: Double = Paper.kneeLow,
+             crossoverHigh: Double = Paper.crossoverHigh,
+             crossoverShadow: Double = Paper.crossoverShadow) {
             self.icc = icc; self.lut = lut; self.mono = mono
             self.newCurve = newCurve; self.span = span
-            self.aim = Master.aimValue(icc: icc, lut: lut, span: span)
+            self.kneeHigh = kneeHigh; self.kneeLow = kneeLow
+            self.crossoverHigh = crossoverHigh; self.crossoverShadow = crossoverShadow
+            self.aim = Master.aimValue(icc: icc, lut: lut, span: span,
+                                      crossoverHigh: crossoverHigh, crossoverShadow: crossoverShadow)
         }
         /// Read the globals. Call on the main actor, then hand the value over.
         static var current: Terminator {
@@ -955,7 +993,8 @@ struct Master: Sendable {
                 Float(Master.curveValue(Double(k) / 65535, lo: lo[c], hi: hi[c],
                                         gamma: ag, aim: aim, slopes: ks,
                                         offset: offs[c],
-                                        shoulder: term.newCurve && term.clampsHard))
+                                        shoulder: term.newCurve && term.clampsHard,
+                                        kneeHigh: term.kneeHigh, kneeLow: term.kneeLow))
             }
         }
         let icc = term.icc
@@ -979,9 +1018,12 @@ struct Master: Sendable {
                              PrintLUT.toSRGB(v.2))
                     } else {
                         let sp = term.span
-                        o = (Float(Paper.transfer(Master.directExposure(Double(r), span: sp), channel: 0)),
-                             Float(Paper.transfer(Master.directExposure(Double(gg), span: sp), channel: 1)),
-                             Float(Paper.transfer(Master.directExposure(Double(bb), span: sp), channel: 2)))
+                        o = (Float(Paper.transfer(Master.directExposure(Double(r), span: sp), channel: 0,
+                                                 crossoverHigh: term.crossoverHigh, crossoverShadow: term.crossoverShadow)),
+                             Float(Paper.transfer(Master.directExposure(Double(gg), span: sp), channel: 1,
+                                                 crossoverHigh: term.crossoverHigh, crossoverShadow: term.crossoverShadow)),
+                             Float(Paper.transfer(Master.directExposure(Double(bb), span: sp), channel: 2,
+                                                 crossoverHigh: term.crossoverHigh, crossoverShadow: term.crossoverShadow)))
                     }
                     if mono {
                         // DEV-MONO: luma in linear light, then one value to all
@@ -1090,10 +1132,12 @@ struct Master: Sendable {
 
     /// 16-bit TIFF keeps the full render; JPEG is the delivery file.
     func write(_ edit: Edit, to url: URL, as type: UTType, quality: Double = 0.92,
-               _ term: Terminator = .current) throws {
+               _ term: Terminator = .current, metadata: [String: Any] = [:]) throws {
         let bits = (type == .tiff || type == .png) ? 16 : 8
         let img = try cgImage(edit, bits: bits, term)
-        guard let dest = CGImageDestinationCreateWithURL(url as CFURL,
+        let temporary = url.deletingLastPathComponent().appendingPathComponent(".horizon-export-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        guard let dest = CGImageDestinationCreateWithURL(temporary as CFURL,
                                                         type.identifier as CFString, 1, nil)
         else { throw Err("cannot create \(url.lastPathComponent)") }
         // TIFF carries a 3144-byte sRGB profile; JPEG carries none, and that is
@@ -1107,11 +1151,17 @@ struct Master: Sendable {
         // this ever exports a WIDER space -- Display P3 or Adobe RGB untagged
         // would genuinely be wrong, and then the fix is to write the APP2
         // segment directly rather than to keep negotiating with ImageIO.
-        CGImageDestinationAddImage(dest, img,
-            [kCGImageDestinationLossyCompressionQuality: quality] as CFDictionary)
+        var properties = metadata
+        properties[kCGImageDestinationLossyCompressionQuality as String] = quality
+        CGImageDestinationAddImage(dest, img, properties as CFDictionary)
         guard CGImageDestinationFinalize(dest) else {
             throw Err("cannot write \(url.lastPathComponent)")
         }
+        // Refuse collisions even if a destination appeared after the dialog.
+        guard !FileManager.default.fileExists(atPath: url.path) else {
+            throw Err("\(url.lastPathComponent) already exists; choose a different name or folder")
+        }
+        try FileManager.default.moveItem(at: temporary, to: url)
     }
 }
 
@@ -1137,11 +1187,14 @@ struct Edit: Codable, Equatable {
     /// where the machine's extra-hard lives -- Tone Adjustment has no such step.
     var gradation: Int = 0
     var quarterTurns = 0        // F2 Rotate, 0-3 clockwise
+    /// Separate automatic offsets make repeated roll correction idempotent
+    /// while preserving the operator's integer printer-light adjustments.
+    var autoCyan = 0.0, autoMagenta = 0.0, autoYellow = 0.0
 
 
     var isNeutral: Bool { cyan == 0 && magenta == 0 && yellow == 0 && density == 0
         && high == .standard && shadow == .standard && gradation == 0
-        && quarterTurns == 0 }
+        && quarterTurns == 0 && autoCyan == 0 && autoMagenta == 0 && autoYellow == 0 }
 
     /// Tolerant decoding, in BOTH directions: a missing key and an out-of-range
     /// value both fall back to the default rather than throwing. The synthesised
@@ -1164,6 +1217,16 @@ struct Edit: Codable, Equatable {
             .flatMap(Paper.Grade.init(rawValue:)) ?? .standard
         gradation = try c.decodeIfPresent(Int.self, forKey: .gradation) ?? 0
         quarterTurns = try c.decodeIfPresent(Int.self, forKey: .quarterTurns) ?? 0
+        autoCyan = (try? c.decodeIfPresent(Double.self, forKey: .autoCyan)) ?? 0
+        autoMagenta = (try? c.decodeIfPresent(Double.self, forKey: .autoMagenta)) ?? 0
+        autoYellow = (try? c.decodeIfPresent(Double.self, forKey: .autoYellow)) ?? 0
+        cyan = cyan.clamped(Paper.cmyRange); magenta = magenta.clamped(Paper.cmyRange)
+        yellow = yellow.clamped(Paper.cmyRange); density = density.clamped(Paper.densRange)
+        gradation = min(max(gradation, -3), 3)
+        quarterTurns = ((quarterTurns % 4) + 4) % 4
+        autoCyan = autoCyan.isFinite ? min(max(autoCyan, -30), 30) : 0
+        autoMagenta = autoMagenta.isFinite ? min(max(autoMagenta, -30), 30) : 0
+        autoYellow = autoYellow.isFinite ? min(max(autoYellow, -30), 30) : 0
     }
     init() {}
     /// The reference machine shows an unset key as "No"; 0 reads better here.
@@ -1179,6 +1242,7 @@ struct Edit: Codable, Equatable {
         if cyan != 0 { parts.append("C\(cyan)") }
         if magenta != 0 { parts.append("M\(magenta)") }
         if yellow != 0 { parts.append("Y\(yellow)") }
+        if autoCyan != 0 || autoMagenta != 0 || autoYellow != 0 { parts.append("Auto") }
         if density != 0 { parts.append("D\(density)") }
         if high != .standard { parts.append("H:\(high.short)") }
         if shadow != .standard { parts.append("S:\(shadow.short)") }

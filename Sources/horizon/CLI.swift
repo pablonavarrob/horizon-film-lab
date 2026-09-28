@@ -74,9 +74,8 @@ func grade(_ v: String?) -> Paper.Grade? {
     default: return nil
     }
 }
-// DEV-CURVE, BEFORE the gradation clamp below: that clamp reads
-// `Paper.gradationRange`, which the flag widens. Parsed after it, `--gradation 3`
-// was silently clamped to 2 and the new top step could not be reached at all.
+// Keep the compatibility flag before the gradation clamp below: the clamp reads
+// `Paper.gradationRange`, so a curve choice must be applied first.
 if args.contains("--new-curve") { Paper.newCurve = true }
 // Shoulder shape, in the same spirit as --xhigh/--xshadow.
 if let k = flagValues("--knee", 2) {
@@ -104,47 +103,71 @@ if let t = toneArg {
     edit.apply(b)
 }
 
+// Read-only border/carrier diagnostics, including rolls with a pending setting.
+if args.contains("--debug-borders") {
+    guard let path = flagValues("--debug-borders", 1)?.first else {
+        fail("--debug-borders needs a capture folder")
+    }
+    let dir = URL(fileURLWithPath: path)
+    let workspace = Workspace(anyOf: dir)
+    let cache = flagValues("--cache", 1)?.first.map { URL(fileURLWithPath: $0) }
+        ?? (FileManager.default.fileExists(atPath: workspace.cache.path)
+            ? workspace.cache : dir.appendingPathComponent(".cache"))
+    let destination = flagValues("--out", 1)?.first.map { URL(fileURLWithPath: $0) }
+        ?? cache.deletingLastPathComponent().appendingPathComponent("debug/borders")
+    guard let session = Invert.loadSession(beside: cache),
+          let layout = Invert.Layout(rawValue: session.layout) else {
+        fail("cannot read this roll's session; re-invert the whole roll first")
+    }
+    do {
+        let report = try Invert.writeBorderDiagnostics(dir: dir, layout: layout, out: cache,
+                                                       destination: destination)
+        print(report.summary)
+        print("Preview: \(report.preview.path)")
+    } catch { fail(error.localizedDescription) }
+    return true
+}
+
 // --invert FOLDER [--layout mono3|rgb3|rgb1|mono1] [--lcc DIR] [--only STEM]
 //                 [--no-border] [--debug-border] [--per-frame-base] [--out DIR]
-//            [--per-frame-base] [--out DIR]
 if let i = args.firstIndex(of: "--invert"), i + 1 < args.count {
     let dir = URL(fileURLWithPath: args[i + 1])
-    // LCC/flat captures excluded, as `Invert.run` excludes them. Counting a flat
-    // changes the file count's parity, and parity is what decides one-shot from
-    // three-shot, so one flat in the folder flipped the layout.
-    let exts: Set<String> = ["tif", "tiff", "png"]
+    // The fresh-folder suggestion sees only photographic captures, as in the UI.
+    let exts = CaptureDecoder.supportedExtensions
     let caps = ((try? FileManager.default.contentsOfDirectory(at: dir,
                     includingPropertiesForKeys: nil)) ?? [])
         .filter { exts.contains($0.pathExtension.lowercased()) && !Invert.isLCC($0) }
-    // Same suggestion the GUI seeds its picker from, so the two never disagree.
-    // On the CLI `--layout` IS the operator's choice; without it, the suggestion
-    // stands in for the picker.
+    // An explicit layout wins, then the saved roll recipe, then this suggestion.
     let suggestion = Invert.suggestLayout(caps)
-    let layout = flagValues("--layout", 1)?.first.flatMap(Invert.Layout.init(rawValue:))
-        ?? suggestion?.layout ?? .rgb3
-    let mono = args.contains("--mono") || (suggestion?.monochrome ?? false)
-    // Defaults TRUE, to match the GUI, which always passes true. It defaulted
-    // false, so every CLI measurement silently used a ROLL base and did not
-    // reproduce the app -- every frame reported the same base and nobody noticed.
-    // `--roll-base` opts out; `--per-frame-base` is kept as a no-op for old scripts.
-    let perFrameBase = !args.contains("--roll-base")
-    let useBorder = !args.contains("--no-border")
+    let explicitLayout = flagValues("--layout", 1)?.first.flatMap(Invert.Layout.init(rawValue:))
     let onlyStem = flagValues("--only", 1)?.first
     let debugBorder = args.contains("--debug-border")
     let lccDir = flagValues("--lcc", 1)?.first.map { URL(fileURLWithPath: $0) }
     let lccFiles = lccDir.flatMap {
         (try? FileManager.default.contentsOfDirectory(at: $0,
             includingPropertiesForKeys: nil))?
-            .filter { ["tif","tiff","png"].contains($0.pathExtension.lowercased()) }
+            .filter { CaptureDecoder.isSupported($0) }
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
     }
     let outDir = flagValues("--out", 1)?.first.map { URL(fileURLWithPath: $0) }
         ?? dir.appendingPathComponent(".cache")
+    let saved = Invert.loadSession(beside: outDir)
+    let layout = explicitLayout ?? saved.flatMap { Invert.Layout(rawValue: $0.layout) }
+        ?? suggestion?.layout ?? .rgb1
+    let mono = args.contains("--mono") || (saved?.monochrome ?? suggestion?.monochrome ?? false)
+    let perFrameBase = args.contains("--roll-base") ? false
+        : args.contains("--per-frame-base") ? true : saved?.perFrameBase ?? true
+    let useBorder = !args.contains("--no-border") && (saved?.useBorder ?? true)
+    let flats = lccDir != nil ? lccFiles : saved.map { $0.lcc.map { URL(fileURLWithPath: $0) } }
+    let carrierMask: Bool? = args.contains("--no-carrier-mask") ? false
+        : args.contains("--carrier-mask") ? true
+        : nil
     do {
         try Invert.run(dir: dir, layout: layout, perFrameBase: perFrameBase,
                        out: outDir, only: onlyStem.map { Set([$0]) },
-                       useBorder: useBorder, lcc: lccFiles,
-                       debugBorder: debugBorder, monochrome: mono)
+                       useBorder: useBorder, lcc: flats,
+                       debugBorder: debugBorder, monochrome: mono,
+                       carrierMaskEnabled: carrierMask)
     } catch { fail(error.localizedDescription) }
     return true
 }
@@ -154,7 +177,7 @@ if let i = args.firstIndex(of: "--icc-only"), i + 3 < args.count {
     let prof = URL(fileURLWithPath: args[i + 1])
     let dir = URL(fileURLWithPath: args[i + 2])
     let out = URL(fileURLWithPath: args[i + 3])
-    let exts: Set<String> = ["tif", "tiff", "png"]
+    let exts = CaptureDecoder.supportedExtensions
     let all = ((try? FileManager.default.contentsOfDirectory(at: dir,
                     includingPropertiesForKeys: nil)) ?? [])
         .filter { exts.contains($0.pathExtension.lowercased()) && !Invert.isLCC($0) }
@@ -227,9 +250,9 @@ if args.contains("--check-grade") {
     // endpoint -- it would have reported a constant 0.70 for ever.
     var worstDrop = 0.0, dropAt = "none", worstOut = 1.0, outAt = "none", cases = 0
     var drOpen = 1.0
-    // DEV-CURVE: sweep BOTH models. The invariants belong to the control surface,
-    // not to one configuration of it, and a flag that only the off-path is tested
-    // against is a flag that breaks the day it is switched on.
+    // Sweep both the standard shoulder and the explicit legacy curve. The
+    // invariants belong to the control surface in either mode.
+    let savedCurveMode = Paper.newCurve
     let curveModes = [false, true]
     for curveMode in curveModes {
     Paper.newCurve = curveMode
@@ -265,7 +288,7 @@ if args.contains("--check-grade") {
                                 worstOut = hiV - lo
                                 outAt = "ch \(ci) d \(d) g \(g) h \(hi.short) s \(sh.short) cmy \(cmy)"
                             }
-                            // DEV-CURVE: the shoulder is asymptotic at the TOP
+                            // The shoulder is asymptotic at the TOP
                             // ONLY, so the white end must stay open. The BLACK end
                             // is expected to reach 0 -- `Paper.kneeLow = 1.0`
                             // disables the lower roll-off on purpose, so blacks
@@ -293,7 +316,7 @@ if args.contains("--check-grade") {
         }
     }
     }
-    Paper.newCurve = false
+    Paper.newCurve = savedCurveMode
     print(String(format: "value path over %d control combinations (both curve models): worst backward step %.2e (%@)",
                  cases, worstDrop, dropAt))
     guard worstDrop == 0 else { fail("the value path is not monotone at \(dropAt)") }
@@ -549,8 +572,10 @@ guard let i = args.firstIndex(of: "--render"), i + 2 < args.count else {
         print("        [--max-edge N] [--crop] [--output-icc PROFILE] [--print-lut NAME]")
         print("Horizon --invert FOLDER [--layout mono3|rgb3|rgb1|mono1] [--out DIR]")
         print("        [--lcc DIR] [--only STEM] [--no-border] [--debug-border] [--mono]")
+        print("        [--carrier-mask | --no-carrier-mask]  new rolls on; saved rolls keep their choice")
+        print("Horizon --debug-borders FOLDER [--cache CACHE] [--out DEBUGDIR]")
         print("Horizon --icc-only PROFILE CAPTURES OUT   raw captures through a profile")
-        print("        [--new-curve]     DEV-CURVE: shouldered contrast model")
+        print("        [--new-curve]     shouldered contrast is standard; flag kept for compatibility")
         print("Horizon --check-grade                    run the gates")
         return true
     }
@@ -582,14 +607,20 @@ do {
         .appendingPathComponent("session.json")
     if let d = try? Data(contentsOf: sessURL),
        let sess = try? JSONDecoder().decode(Invert.Session.self, from: d) {
-        let stem = inURL.deletingPathExtension().lastPathComponent
-            .replacingOccurrences(of: ".ntg", with: "")
+        guard sess.pendingCarrierMaskEnabled == nil else {
+            throw Err("carrier analysis requires re-inverting the whole roll before exporting")
+        }
+        let stem = FrameItem.stem(of: inURL)
         frameRect = sess.frameBorders[stem]
         // DEV-GATE: the whole roll's gate, so a CLI render measures what the
         // editor measures. Reading one frame's own rectangle here made the CLI
         // disagree with the app on exactly the frames whose detection failed.
         let detector = Invert.Border.gate(of: sess.frameBorders)
         statsGate = detector
+        if sess.carrierMaskEnabled, let extra = sess.carrierBorders[stem] {
+            statsGate = .init(left: max(detector.left, extra.left), top: max(detector.top, extra.top),
+                              right: max(detector.right, extra.right), bottom: max(detector.bottom, extra.bottom))
+        }
         // The roll's film type, so the CLI renders a B&W roll as B&W without
         // being told. --mono still forces it for a roll with no session.
         if sess.monochrome { Paper.monochrome = true }

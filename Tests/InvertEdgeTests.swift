@@ -47,8 +47,11 @@ final class InvertEdgeTests {
     }
 
     func testTIFFImportWithEmptyGreenBorderSamples() throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent("horizon-import-test-\(UUID().uuidString)", isDirectory: true)
+        guard let scratch = ProcessInfo.processInfo.environment["HORIZON_TEST_TMP"] else {
+            preconditionFailure("run Tests/run-invert-edge-tests.sh so fixtures stay in its cleaned temp directory")
+        }
+        let root = URL(fileURLWithPath: scratch, isDirectory: true)
+            .appendingPathComponent("tiff-import-fixture", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
 
@@ -75,12 +78,21 @@ final class InvertEdgeTests {
 
 @main
 struct InvertEdgeTestRunner {
+    @MainActor
     static func main() throws {
+        // Preserve the completed checks in tool/CI logs if a later assertion traps.
+        setbuf(stdout, nil)
         let tests = InvertEdgeTests()
         tests.testBorderWithEmptyGreenOrBlueSamples()
         tests.testOrdinaryBorderRemainsDetected()
         tests.testOpaqueBorderWithAllSamplesFiltered()
         try tests.testTIFFImportWithEmptyGreenBorderSamples()
         print("4 edge/import regression tests passed")
+        try WorkflowRegressionTests().run()
+        try runCarrierDiagnosticsTests()
+        try runStateRenderTests()
+        try runExportDialogTests()
+        try runExportPatternTests()
+        try RecentRollTests().run()
     }
 }

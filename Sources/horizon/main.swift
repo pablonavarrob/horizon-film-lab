@@ -17,22 +17,25 @@ if runCLI() { exit(0) }
 let app = NSApplication.shared
 app.setActivationPolicy(.regular)
 
-/// Clicking the dock icon with no visible window has to bring the window back.
-/// Without this the window is merely ORDERED OUT when you close it -- it still
-/// exists, holding the whole roll -- and the click does nothing at all, which
-/// reads as the app being hung. `applicationShouldTerminateAfterLastWindowClosed`
-/// stays false on purpose so closing the window keeps the session and its
-/// undo history alive.
+/// Reuse the same window and roll when reopening from the Dock. Ordering a
+/// minimized window front does not restore it: it must be deminiaturized first.
+/// Other visible panels must not prevent the main window from coming back.
 final class Delegate: NSObject, NSApplicationDelegate {
     var window: NSWindow?
     func applicationShouldTerminateAfterLastWindowClosed(_ a: NSApplication) -> Bool { false }
     func applicationShouldHandleReopen(_ a: NSApplication,
-                                       hasVisibleWindows flag: Bool) -> Bool {
-        if !flag, let w = window {
+                                       hasVisibleWindows _: Bool) -> Bool {
+        guard let w = window else { return true }
+        if w.isMiniaturized { w.deminiaturize(nil) }
+        if let dialog = a.modalWindow ?? w.attachedSheet {
+            // Keep an open import/export dialog in control of keyboard input.
+            w.orderFront(nil)
+            dialog.makeKeyAndOrderFront(nil)
+        } else {
             w.makeKeyAndOrderFront(nil)
-            a.activate(ignoringOtherApps: true)
         }
-        return true
+        a.activate(ignoringOtherApps: true)
+        return false // The existing window has handled the reopen request.
     }
 }
 let delegate = Delegate()
@@ -44,16 +47,43 @@ let window = NSWindow(
     styleMask: [.titled, .closable, .miniaturizable, .resizable],
     backing: .buffered, defer: false)
 window.title = "Horizon — Digital Image Export"
+// Closing the window also keeps the current roll available for a Dock reopen.
+window.isReleasedWhenClosed = false
 window.contentView = NSHostingView(rootView: ContentView(store: store))
 window.center()
 window.makeKeyAndOrderFront(nil)
 delegate.window = window
 
-// Menu bar. Export format lives in Settings here rather than in the window,
-// so the panel stays about correcting the picture.
-final class AppActions: NSObject {
+// Menu bar. Roll and export options live with their corresponding workflow.
+final class AppActions: NSObject, NSMenuItemValidation {
     let store: RollStore
     init(store: RollStore) { self.store = store }
+    @MainActor func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        // A sheet suspends its parent window, but explicit menu targets still
+        // need validation so shortcuts cannot start a second roll operation.
+        guard !store.isPresentingDialog else { return false }
+        switch menuItem.action {
+        case #selector(exportSelected): return store.canExport && store.current != nil
+        case #selector(exportAll): return store.canExport
+        case #selector(editRollSettings), #selector(reinvertRoll),
+             #selector(generateBorderDebugImages):
+            return store.workspace != nil && !store.isProcessing
+        case #selector(toggleCarrierMask(_:)):
+            return store.canToggleCarrierMask
+        case #selector(reinvertFrame):
+            return store.workspace != nil && store.current != nil && !store.isProcessing
+                && !store.carrierMaskRequiresReinversion
+        case #selector(correctRollColour):
+            return !store.frames.isEmpty && !store.isProcessing && !store.carrierMaskRequiresReinversion
+        case #selector(showBorderDebugImages):
+            return store.hasBorderDebugImages && !store.diagnosingBorders
+        case #selector(setRolloff(_:)):
+            return (store.usesPrintLUT || store.usesICCPrintModel) && store.newCurve
+        case #selector(setSpan(_:)):
+            return store.usesBuiltInPrintModel
+        default: return true
+        }
+    }
     @MainActor @objc func undo() { store.undo() }
     @MainActor @objc func redo() { store.redo() }
     @MainActor @objc func newRoll() { store.newRoll() }
@@ -66,15 +96,7 @@ final class AppActions: NSObject {
     }
     @MainActor @objc func exportSelected() { store.exportAll(selectedOnly: true) }
     @MainActor @objc func exportAll() { store.exportAll() }
-    @MainActor @objc func toggleTIFF(_ item: NSMenuItem) {
-        store.wantTIFF.toggle(); item.state = store.wantTIFF ? .on : .off
-    }
-    @MainActor @objc func toggleJPEG(_ item: NSMenuItem) {
-        store.wantJPEG.toggle(); item.state = store.wantJPEG ? .on : .off
-    }
-    @MainActor @objc func toggleCropExport(_ item: NSMenuItem) {
-        store.cropExport.toggle(); item.state = store.cropExport ? .on : .off
-    }
+    @MainActor @objc func editRollSettings() { store.editRollDetails() }
     /// DEV-REVIEW
     @MainActor @objc func toggleReview(_ item: NSMenuItem) {
         store.reviewGrid.toggle(); item.state = store.reviewGrid ? .on : .off
@@ -100,10 +122,15 @@ final class AppActions: NSObject {
     /// DEV-CURVE
     @MainActor @objc func toggleCurve(_ item: NSMenuItem) {
         store.newCurve.toggle(); item.state = store.newCurve ? .on : .off
+        syncCurveMenu()
     }
-    // DEV-CAST. A meter and a separate action; nothing measures automatically.
-    @MainActor @objc func measureCast() { store.reportRollCast() }
-    @MainActor @objc func applyCast() { store.applyRollCast() }
+    @MainActor @objc func correctRollColour() { store.correctRollColour() }
+    @MainActor @objc func toggleCarrierMask(_ item: NSMenuItem) {
+        store.toggleCarrierMask()
+        syncRollMenus()
+    }
+    @MainActor @objc func generateBorderDebugImages() { store.generateBorderDebugImages() }
+    @MainActor @objc func showBorderDebugImages() { store.showBorderDebugImages() }
     @MainActor @objc func chooseLCC() { store.chooseLCC() }
     @MainActor @objc func clearLCC() { store.clearLCC() }
     /// The print model is ONE choice: the built-in curve, a .cube, or an ICC.
@@ -119,6 +146,16 @@ final class AppActions: NSObject {
     @MainActor @objc func chooseICC() { store.chooseICC(); syncPrintMenu() }  // DEV-ICC
 
     nonisolated(unsafe) static var printMenu: NSMenu?
+    nonisolated(unsafe) static var curveMenu: NSMenu?
+    nonisolated(unsafe) static var curveToggleItem: NSMenuItem?
+    nonisolated(unsafe) static var automaticCarrierItem: NSMenuItem?
+    nonisolated(unsafe) static var carrierReinvertItem: NSMenuItem?
+    nonisolated(unsafe) static var borderDebugItem: NSMenuItem?
+    nonisolated(unsafe) static var showBorderDebugItem: NSMenuItem?
+    nonisolated(unsafe) static var reviewItem: NSMenuItem?
+    nonisolated(unsafe) static var gridSizeMenu: NSMenu?
+    nonisolated(unsafe) static var correctColourItem: NSMenuItem?
+    nonisolated(unsafe) static var rollSettingsItem: NSMenuItem?
     /// Re-tick the whole group from the store, wherever the change came from.
     ///
     /// The ticks used to be set only by `setPrintModel`, and only from the items
@@ -126,27 +163,44 @@ final class AppActions: NSObject {
     /// ticked while the ICC was rendering, and the menu disagreed with the pixels.
     @MainActor func syncPrintMenu() {
         guard let m = AppActions.printMenu else { return }
-        let lut = store.printLUTPath, icc = store.iccPath
+        let lut = store.printLUTPath
         let bundled = Set(PrintLUT.bundled().map(\.path))
         for i in m.items {
             switch i.tag {
-            case 1: i.state = lut.isEmpty && icc.isEmpty ? .on : .off
-            case 2: i.state = !lut.isEmpty && !bundled.contains(lut) ? .on : .off
-            case 3: i.state = icc.isEmpty ? .off : .on
+            case 1: i.state = store.usesBuiltInPrintModel ? .on : .off
+            case 2: i.state = store.usesPrintLUT && !bundled.contains(lut) ? .on : .off
+            case 3: i.state = store.usesICCPrintModel ? .on : .off
             default:
                 if let p = i.representedObject as? String, !p.isEmpty {
-                    i.state = p == lut && icc.isEmpty ? .on : .off
+                    i.state = store.usesPrintLUT && p == lut ? .on : .off
                 }
+            }
+        }
+        syncCurveMenu()
+    }
+    @MainActor func syncCurveMenu() {
+        guard let menu = AppActions.curveMenu else { return }
+        let externalPrint = store.usesPrintLUT || store.usesICCPrintModel
+        AppActions.curveToggleItem?.state = store.newCurve ? .on : .off
+        for i in menu.items {
+            if i.action == #selector(AppActions.setRolloff) {
+                i.isEnabled = externalPrint && store.newCurve
+                i.toolTip = "Available with a .cube or ICC print emulation when Shouldered Contrast Curve is on."
+            } else if i.action == #selector(AppActions.setSpan) {
+                i.isEnabled = store.usesBuiltInPrintModel
+                i.toolTip = "Choose Settings → Print Emulation → Horizon RA-4 (built-in)."
             }
         }
     }
     /// DEV-MONO. Capture mode changes the INVERSION, so it says so; film type
     /// changes only the render and takes effect on the next redraw.
     @MainActor @objc func setCapture(_ item: NSMenuItem) {
+        guard !store.isProcessing else { return }
         store.setShotsPerFrame((item.representedObject as? String ?? "3") == "3")
         syncRollMenus()      // shots-per-frame can settle the film type on its own
     }
     @MainActor @objc func setFilm(_ item: NSMenuItem) {
+        guard !store.isProcessing else { return }
         store.monochrome = item.tag == 1
         syncRollMenus()
     }
@@ -165,6 +219,21 @@ final class AppActions: NSObject {
     /// updates them too -- they used to reflect only changes made from the menu.
     @MainActor func syncRollMenus() {
         syncFilmMenu()
+        AppActions.automaticCarrierItem?.state = store.carrierMaskEnabled ? .on : .off
+        AppActions.automaticCarrierItem?.isEnabled = store.canToggleCarrierMask
+        AppActions.automaticCarrierItem?.toolTip = store.automaticCarrierDescription
+        AppActions.carrierReinvertItem?.title = store.carrierMaskRequiresReinversion
+            ? "Re-invert Whole Roll to Apply Carrier Change…" : "Re-invert Whole Roll"
+        AppActions.carrierReinvertItem?.isEnabled = store.workspace != nil && !store.isProcessing
+        AppActions.borderDebugItem?.isEnabled = store.workspace != nil && !store.isProcessing
+        AppActions.showBorderDebugItem?.isEnabled = store.hasBorderDebugImages && !store.diagnosingBorders
+        AppActions.rollSettingsItem?.isEnabled = store.workspace != nil && !store.isProcessing
+        AppActions.correctColourItem?.isEnabled = !store.frames.isEmpty && !store.isProcessing
+            && !store.carrierMaskRequiresReinversion
+        AppActions.reviewItem?.state = store.reviewGrid ? .on : .off
+        for item in AppActions.gridSizeMenu?.items ?? [] {
+            item.state = item.tag == store.gridSize ? .on : .off
+        }
         if let sub = AppActions.capture {
             let three = store.captureMode == .rgb3 || store.captureMode == .mono3
             for i in sub.items {
@@ -184,6 +253,16 @@ let actions = MainActor.assumeIsolated { AppActions(store: store) }
 MainActor.assumeIsolated {
     RollStore.onRollProps = { [weak actions] in actions?.syncRollMenus() }
 }
+
+final class WorkflowMenuDelegate: NSObject, NSMenuDelegate {
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        MainActor.assumeIsolated {
+            actions.syncRollMenus()
+            actions.syncPrintMenu()
+        }
+    }
+}
+let workflowMenuDelegate = WorkflowMenuDelegate()
 
 func item(_ title: String, _ sel: Selector, _ key: String = "",
           _ mods: NSEvent.ModifierFlags = .command, state: NSControl.StateValue? = nil) -> NSMenuItem {
@@ -212,6 +291,9 @@ fileMenu.addItem(item("Redo", #selector(AppActions.redo), "Z", [.command, .shift
 fileMenu.addItem(.separator())
 fileMenu.addItem(item("New Roll…", #selector(AppActions.newRoll), "n"))
 fileMenu.addItem(item("Open Roll…", #selector(AppActions.openRoll), "o"))
+let rollSettingsItem = item("Roll Settings…", #selector(AppActions.editRollSettings))
+AppActions.rollSettingsItem = rollSettingsItem
+fileMenu.addItem(rollSettingsItem)
 fileMenu.addItem(item("Close Roll", #selector(AppActions.closeRoll), "w",
                       [.command, .shift]))
 // DEV-RECENT: same list as the idle panel, reachable while a roll is open.
@@ -224,14 +306,24 @@ let recentMenu = NSMenu(title: "Open Recent")
 final class RecentsMenu: NSObject, NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
-        for (i, u) in RollStore.loadRecents().enumerated() {
-            let it = NSMenuItem(title: u.lastPathComponent,
+        for (i, roll) in RollStore.loadRecentOrders().enumerated() {
+            let it = NSMenuItem(title: roll.title,
                                 action: #selector(AppActions.openRecent(_:)),
                                 keyEquivalent: i < 9 ? String(i + 1) : "")
             it.keyEquivalentModifierMask = [.command, .control]
             it.target = actions
-            it.representedObject = u
-            it.toolTip = u.path
+            it.representedObject = roll.url
+            if !roll.subtitle.isEmpty {
+                let title = NSMutableAttributedString(string: roll.title, attributes: [
+                    .font: NSFont.menuFont(ofSize: 0)
+                ])
+                title.append(NSAttributedString(string: "  ·  " + roll.subtitle, attributes: [
+                    .font: NSFont.menuFont(ofSize: NSFont.smallSystemFontSize),
+                    .foregroundColor: NSColor.secondaryLabelColor
+                ]))
+                it.attributedTitle = title
+            }
+            it.toolTip = roll.tooltip
             menu.addItem(it)
         }
         if menu.items.isEmpty {
@@ -266,92 +358,68 @@ fileMenu.addItem(.separator())
 fileMenu.addItem(item("Export Selected Frame", #selector(AppActions.exportSelected), "e"))
 fileMenu.addItem(item("Export All Frames", #selector(AppActions.exportAll), "E", [.command, .shift]))
 fileItem.submenu = fileMenu
+fileMenu.delegate = workflowMenuDelegate
 mainMenu.addItem(fileItem)
+
+let editItem = NSMenuItem()
+let editMenu = NSMenu(title: "Edit")
+let correctColourItem = item("Correct Roll Colour", #selector(AppActions.correctRollColour), "k")
+AppActions.correctColourItem = correctColourItem
+editMenu.addItem(correctColourItem)
+editItem.submenu = editMenu
+editMenu.delegate = workflowMenuDelegate
+mainMenu.addItem(editItem)
+
+let viewItem = NSMenuItem()
+let viewMenu = NSMenu(title: "View")
+MainActor.assumeIsolated {
+    let review = item("Review Grid", #selector(AppActions.toggleReview), "g",
+                      .command, state: store.reviewGrid ? .on : .off)
+    AppActions.reviewItem = review
+    viewMenu.addItem(review)
+    let grid = NSMenuItem(title: "Review Grid Size", action: nil, keyEquivalent: "")
+    let sizes = NSMenu()
+    for n in [6, 8, 12] {
+        let i = item("\(n) frames", #selector(AppActions.setGridSize), "", .command,
+                     state: store.gridSize == n ? .on : .off)
+        i.tag = n
+        sizes.addItem(i)
+    }
+    grid.submenu = sizes
+    AppActions.gridSizeMenu = sizes
+    viewMenu.addItem(grid)
+}
+viewItem.submenu = viewMenu
+viewMenu.delegate = workflowMenuDelegate
+mainMenu.addItem(viewItem)
 
 let setItem = NSMenuItem()
 let setMenu = NSMenu(title: "Settings")
-let fmt = NSMenuItem(title: "Export Format", action: nil, keyEquivalent: "")
-let fmtMenu = NSMenu()
 MainActor.assumeIsolated {
-    fmtMenu.addItem(item("16-bit TIFF", #selector(AppActions.toggleTIFF), "", .command,
-                         state: store.wantTIFF ? .on : .off))
-    fmtMenu.addItem(item("JPEG", #selector(AppActions.toggleJPEG), "", .command,
-                         state: store.wantJPEG ? .on : .off))
+    let carrier = item("Automatic Carrier Handling — Beta", #selector(AppActions.toggleCarrierMask(_:)),
+                       "", .command, state: store.carrierMaskEnabled ? .on : .off)
+    carrier.toolTip = store.automaticCarrierDescription
+    AppActions.automaticCarrierItem = carrier
+    setMenu.addItem(carrier)
+    let reinvert = item("Re-invert Whole Roll", #selector(AppActions.reinvertRoll))
+    AppActions.carrierReinvertItem = reinvert
+    setMenu.addItem(reinvert)
+    let debug = item("Generate Border Debug Images…", #selector(AppActions.generateBorderDebugImages))
+    debug.toolTip = "Generate inspection PNGs without changing the roll or its carrier setting."
+    AppActions.borderDebugItem = debug
+    setMenu.addItem(debug)
+    let showDebug = item("Show Border Debug Images", #selector(AppActions.showBorderDebugImages))
+    AppActions.showBorderDebugItem = showDebug
+    setMenu.addItem(showDebug)
 }
-MainActor.assumeIsolated {
-    fmtMenu.addItem(.separator())
-    fmtMenu.addItem(item("Crop to Detected Frame", #selector(AppActions.toggleCropExport),
-                         "", .command, state: store.cropExport ? .on : .off))
-}
-fmt.submenu = fmtMenu
-setMenu.addItem(fmt)
-setMenu.addItem(.separator())
-setMenu.addItem(item("Load LCC / Flat Frame…", #selector(AppActions.chooseLCC), "l"))
-setMenu.addItem(item("Clear LCC", #selector(AppActions.clearLCC)))
-setMenu.addItem(.separator())
-// DEV-MONO: the roll's two properties. Both are also on the import panel; these
-// are for changing them afterwards.
-MainActor.assumeIsolated {
-    // THESE TWO BELONG TO THE ROLL, not to the app, and they are the only such
-    // controls in this menu -- everything around them (export format, print
-    // model, review grid) is app-wide. They sat loose among those, which is what
-    // made them hard to place. Grouped under one heading that says so. Capture
-    // carries the one note worth carrying -- it changes the INVERSION, so it does
-    // nothing until the roll is re-inverted -- in the same words `setShotsPerFrame`
-    // already puts in the status bar. Film needs no note: it is a render property
-    // and the picture changes as you pick it. Option wording is untouched, because
-    // it matches the import picker, which is the one place this always read clearly.
-    let rollItem = NSMenuItem(title: "This Roll", action: nil, keyEquivalent: "")
-    let rollSub = NSMenu()
-
-    let capItem = NSMenuItem(title: "Capture (re-invert to apply)", action: nil,
-                             keyEquivalent: "")
-    let capSub = NSMenu()
-    let three = store.captureMode == .rgb3 || store.captureMode == .mono3
-    for (tag, label) in [("3", "Trichromatic (RGB)"), ("1", "Single shot")] {
-        let i = item(label, #selector(AppActions.setCapture), "", .command,
-                     state: (three ? "3" : "1") == tag ? .on : .off)
-        i.representedObject = tag
-        capSub.addItem(i)
-    }
-    capItem.submenu = capSub
-    AppActions.capture = capSub
-    rollSub.addItem(capItem)
-
-    let filmItem = NSMenuItem(title: "Film", action: nil, keyEquivalent: "")
-    let filmSub = NSMenu()
-    for (tag, label) in [(0, "Colour"), (1, "Black & white")] {
-        let i = item(label, #selector(AppActions.setFilm), "", .command,
-                     state: (store.monochrome ? 1 : 0) == tag ? .on : .off)
-        i.tag = tag
-        filmSub.addItem(i)
-    }
-    filmItem.submenu = filmSub
-    AppActions.film = filmSub
-    rollSub.addItem(filmItem)
-
-    // No key equivalent: File already owns ⇧⌘R, and two items sharing a shortcut
-    // is a bug. This copy is here so the action sits next to the control that
-    // requires it.
-    rollSub.addItem(.separator())
-    rollSub.addItem(item("Re-invert Whole Roll", #selector(AppActions.reinvertRoll)))
-    rollItem.submenu = rollSub
-    setMenu.addItem(rollItem)
-}
-// Border detection is NOT a setting. It always runs: the frame rectangle is a
-// statistics mask every frame needs, and an off switch only ever produced worse
-// colour. Diagnostics are developer tooling and live on the CLI, behind
-// `--debug-border`; `--no-border` is there too, for bisecting a bad detection.
-// Curve. The two print models own DIFFERENT curve parameters, so each entry says
-// which one it affects rather than pretending to be universal: the built-in RA-4
-// never clamps and brings its own shoulder, an ICC or .cube clamps and does not.
 setMenu.addItem(.separator())
 let curveItem = NSMenuItem(title: "Curve", action: nil, keyEquivalent: "")
 let curveMenu = NSMenu()
 MainActor.assumeIsolated {
-    curveMenu.addItem(item("Shouldered Contrast Curve",
-                           #selector(AppActions.toggleCurve), "", .command,
-                           state: store.newCurve ? .on : .off))
+    let shouldered = item("Shouldered Contrast Curve", #selector(AppActions.toggleCurve),
+                          "", .command, state: store.newCurve ? .on : .off)
+    AppActions.curveToggleItem = shouldered
+    curveMenu.addItem(shouldered)
     curveMenu.addItem(.separator())
     let rollTitle = NSMenuItem(title: "Highlight Rolloff  (ICC / .cube)",
                                action: nil, keyEquivalent: "")
@@ -376,46 +444,24 @@ MainActor.assumeIsolated {
     }
 }
 curveItem.submenu = curveMenu
+curveMenu.delegate = workflowMenuDelegate
+AppActions.curveMenu = curveMenu
+MainActor.assumeIsolated { actions.syncCurveMenu() }
 setMenu.addItem(curveItem)
-
-// DEV-REVIEW: the consistency pass, and how many frames it shows.
-setMenu.addItem(.separator())
-MainActor.assumeIsolated {
-    setMenu.addItem(item("Review Grid", #selector(AppActions.toggleReview), "g",
-                         .command, state: store.reviewGrid ? .on : .off))
-    let gsItem = NSMenuItem(title: "Review Grid Size", action: nil, keyEquivalent: "")
-    let gsMenu = NSMenu()
-    for n in [6, 8, 12] {
-        let i = item("\(n) frames", #selector(AppActions.setGridSize), "", .command,
-                     state: store.gridSize == n ? .on : .off)
-        i.tag = n
-        gsMenu.addItem(i)
-    }
-    gsItem.submenu = gsMenu
-    setMenu.addItem(gsItem)
-}
-
-// DEV-CAST: measure the roll's residual cast, then dial it on if it is worth it.
-// Two items on purpose -- reading the number and acting on it are different
-// decisions, and the reading is the part that is always safe.
-setMenu.addItem(.separator())
-setMenu.addItem(item("Measure Roll Colour Cast", #selector(AppActions.measureCast), "k"))
-setMenu.addItem(item("Apply Roll Colour Cast to All Frames",
-                     #selector(AppActions.applyCast), "K", [.command, .shift]))
 
 setMenu.addItem(.separator())
 let pmItem = NSMenuItem(title: "Print Emulation", action: nil, keyEquivalent: "")
 let pmMenu = NSMenu()
 MainActor.assumeIsolated {
     let builtin = item("Horizon RA-4 (built-in)", #selector(AppActions.setPrintModel), "",
-                       .command, state: store.printLUTPath.isEmpty ? .on : .off)
+                       .command, state: store.usesBuiltInPrintModel ? .on : .off)
     builtin.representedObject = ""
     builtin.tag = 1
     pmMenu.addItem(builtin)
     for u in PrintLUT.bundled() {
         let i = item(u.deletingPathExtension().lastPathComponent,
                      #selector(AppActions.setPrintModel), "", .command,
-                     state: store.printLUTPath == u.path ? .on : .off)
+                     state: store.usesPrintLUT && store.printLUTPath == u.path ? .on : .off)
         i.representedObject = u.path
         pmMenu.addItem(i)
     }
@@ -434,7 +480,15 @@ MainActor.assumeIsolated {
 }
 pmItem.submenu = pmMenu
 setMenu.addItem(pmItem)
+setMenu.addItem(.separator())
+let advanced = NSMenuItem(title: "Advanced", action: nil, keyEquivalent: "")
+let advancedMenu = NSMenu()
+advancedMenu.addItem(item("Choose Flat-Field Reference…", #selector(AppActions.chooseLCC), "l"))
+advancedMenu.addItem(item("Clear Flat-Field Reference", #selector(AppActions.clearLCC)))
+advanced.submenu = advancedMenu
+setMenu.addItem(advanced)
 setItem.submenu = setMenu
+setMenu.delegate = workflowMenuDelegate
 mainMenu.addItem(setItem)
 
 app.mainMenu = mainMenu
@@ -443,6 +497,8 @@ MainActor.assumeIsolated {
     // didSet does not fire for a stored value, so every mirrored default is
     // pushed from one place. See `RollStore.restoreGlobals`.
     store.restoreGlobals()
+    actions.syncPrintMenu()
+    actions.syncRollMenus()
     installKeyMonitor(store)
     if let f = launchFolder { store.accept(f) }
 }

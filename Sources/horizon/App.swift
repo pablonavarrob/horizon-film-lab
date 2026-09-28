@@ -14,17 +14,21 @@ final class FrameItem: Identifiable, ObservableObject {
     @Published private(set) var scopes: Scopes?
     @Published private(set) var parade: Parade?
     @Published private(set) var loaded = false
+    @Published private(set) var loadError: String?
 
     private var master: Master?
+    private var loadTask: Task<Master, Error>?
+    private var loadGeneration = UUID()
 
     var name: String { FrameItem.stem(of: url) }
 
     /// The master stem: the filename with whichever inverter's suffix it carries
     /// stripped. Both this and `export` derived it with identical inline code.
     nonisolated static func stem(of url: URL) -> String {
-        url.deletingPathExtension().lastPathComponent
-            .replacingOccurrences(of: "_cineon", with: "")
-            .replacingOccurrences(of: ".ntg", with: "")
+        let stem = url.deletingPathExtension().lastPathComponent
+        if stem.hasSuffix(".ntg") { return String(stem.dropLast(4)) }
+        if stem.hasSuffix("_cineon") { return String(stem.dropLast(7)) }
+        return stem
     }
 
     init(url: URL) {
@@ -38,10 +42,19 @@ final class FrameItem: Identifiable, ObservableObject {
 
     /// Drop the cached master so the next load re-reads it from disk. Used when
     /// a single frame is re-inverted — no reason to rebuild the whole roll.
-    func reload() async {
-        master = nil
-        loaded = false
-        await loadIfNeeded()
+    func reload() async { dropMaster(); await loadIfNeeded() }
+
+    func dropMaster() {
+        cancelLoad(); master = nil; loaded = false; loadError = nil
+    }
+
+    func cancelLoad() {
+        loadGeneration = UUID()
+        loadTask?.cancel(); loadTask = nil
+    }
+
+    func colourInput() -> RollColourCorrection.Input? {
+        master.map { .init(master: $0, edit: edit) }
     }
 
     /// This frame's own detected rectangle, from session.json. The picture
@@ -55,13 +68,27 @@ final class FrameItem: Identifiable, ObservableObject {
 
     func loadIfNeeded() async {
         guard master == nil else { return }
-        let u = url, fr = statsGate
-        let m = await Task.detached(priority: .userInitiated) {
-            try? Master.load(u, maxEdge: FrameItem.previewEdge, frame: fr)
-        }.value
-        master = m
-        loaded = true
-        redraw()
+        let generation = loadGeneration
+        if loadTask == nil {
+            let u = url, fr = statsGate
+            loadTask = Task.detached(priority: .userInitiated) {
+                try Task.checkCancellation()
+                let result = try Master.load(u, maxEdge: FrameItem.previewEdge, frame: fr)
+                try Task.checkCancellation()
+                return result
+            }
+        }
+        guard let task = loadTask else { return }
+        do {
+            let result = try await task.value
+            guard generation == loadGeneration, !Task.isCancelled else { return }
+            master = result; loaded = true; loadError = nil; loadTask = nil
+            redraw()
+        } catch {
+            guard generation == loadGeneration else { return }
+            loadTask = nil; loaded = false
+            if !(error is CancellationError) { loadError = error.localizedDescription }
+        }
     }
 
     /// DEV-SCOPE — the frame rectangle follows the picture through a rotation.
@@ -116,64 +143,6 @@ final class FrameItem: Identifiable, ObservableObject {
 
     var autoLight: Double { master?.autoLight ?? 0 }
 
-    /// DEV-CAST — the mean of this frame's NEAR-NEUTRAL pixels, as rendered.
-    ///
-    /// Near-neutral only, and that restriction is the whole safety argument: a
-    /// frame's overall average colour IS its scene colour, so correcting to it is
-    /// grey-world, which renders cream sky and teal water (see DEV-DIRECT in
-    /// Master.swift, where per-channel endpoints were rejected for exactly that).
-    /// Pixels whose channels ALREADY nearly agree are the only ones that carry an
-    /// opinion about neutral, which is what a lab analyser read.
-    ///
-    /// `n` is the vote count, and it doubles as the confidence: a strongly
-    /// coloured scene has little near-neutral mass and should barely count. On the
-    /// two real rolls it runs 1.5% of pixels on the most saturated frames against
-    /// 54% on the flattest.
-    ///
-    /// MASKED BY THE ROLL GATE, like every other statistic in the app. It was not,
-    /// and walked the whole rendered frame -- 7% of the votes on both test rolls
-    /// came from OUTSIDE the gate, i.e. from the border. It happened not to move
-    /// the answer (the keys round the same either way, R-G -2.37 against -2.15),
-    /// because rebate renders black and carrier renders white and the level window
-    /// below rejects both. That is luck, not design: the transition band at the
-    /// film edge is flat and low-spread, exactly what this counts as neutral, and
-    /// a fogged or scratched edge landing inside the window would vote.
-    ///
-    /// The mask is turned with the picture, the same way `redraw` turns it for the
-    /// scopes -- `cgImage` applies `edit.quarterTurns`, so an unturned mask would
-    /// sample the wrong edges on a rotated frame.
-    func neutralSample(_ term: Master.Terminator) -> (r: Double, g: Double,
-                                                      b: Double, n: Int)? {
-        guard let master, let img = try? master.cgImage(edit, bits: 8, term),
-              let data = img.dataProvider?.data as Data? else { return nil }
-        let w = img.width, h = img.height, rb = img.bytesPerRow
-        let comps = img.bitsPerPixel / 8
-        guard comps >= 3, data.count >= rb * h else { return nil }
-        let gate = FrameItem.turn(master.frameMask, by: edit.quarterTurns)
-        let (gx0, gx1, gy0, gy1) = (gate ?? .init()).inner(w: w, h: h, least: 32)
-        var sr = 0.0, sg = 0.0, sb = 0.0, n = 0
-        data.withUnsafeBytes { raw in
-            guard let base = raw.baseAddress else { return }
-            let p = base.assumingMemoryBound(to: UInt8.self)
-            // Every 2nd pixel each way: ~4x cheaper and the statistic is a mean
-            // over tens of thousands of votes either way.
-            for y in stride(from: gy0, to: gy1, by: 2) {
-                let row = p + y * rb
-                for x in stride(from: gx0, to: gx1, by: 2) {
-                    let o = x * comps
-                    let r = Double(row[o]), g = Double(row[o + 1]), b = Double(row[o + 2])
-                    let lvl = (r + g + b) / 3
-                    guard lvl > 60, lvl < 200 else { continue }
-                    let spread = max(r, max(g, b)) - min(r, min(g, b))
-                    guard spread < 18 else { continue }
-                    sr += r; sg += g; sb += b; n += 1
-                }
-            }
-        }
-        guard n >= 500 else { return nil }
-        return (sr / Double(n), sg / Double(n), sb / Double(n), n)
-    }
-
     /// The frame's own stretch endpoints -- what actually drives the render.
     /// Printer lights used to sit here, but nothing downstream reads them.
     var levels: (lo: [Double], hi: [Double])? { master?.directLevels(edit) }
@@ -201,16 +170,17 @@ final class FrameItem: Identifiable, ObservableObject {
                             gate: Invert.Border?, to dir: URL,
                             tiff: Bool, jpeg: Bool,
                             cropToFrame: Bool = false,
-                            term: Master.Terminator) throws {
+                            term: Master.Terminator, outputStem: String? = nil,
+                            metadata: [String: Any] = [:]) throws {
         // DEV-GATE: statistics through the roll gate, crop through this frame's
         // own rectangle. Two different jobs, so two different rectangles.
         let full = try Master.load(url, maxEdge: nil, frame: gate,
                                    crop: cropToFrame ? fr : nil)
-        let stem = FrameItem.stem(of: url)
+        let stem = outputStem ?? FrameItem.stem(of: url)
         if tiff { try full.write(edit, to: dir.appendingPathComponent(stem + ".tif"),
-                                 as: .tiff, quality: 0.92, term) }
+                                 as: .tiff, quality: 0.92, term, metadata: metadata) }
         if jpeg { try full.write(edit, to: dir.appendingPathComponent(stem + ".jpg"),
-                                 as: .jpeg, quality: 0.92, term) }
+                                 as: .jpeg, quality: 0.92, term, metadata: metadata) }
     }
 }
 
@@ -240,6 +210,8 @@ struct Workspace {
     var edits: URL { root.appendingPathComponent("edits.json") }
     var cache: URL { root.appendingPathComponent("cache") }
     var session: URL { root.appendingPathComponent("session.json") }
+    var metadata: URL { root.appendingPathComponent("metadata.json") }
+    var borderDebug: URL { root.appendingPathComponent("debug/borders", isDirectory: true) }
 
     /// Accepts the capture folder, or anything inside its workspace, and works
     /// back to the capture folder either way.
@@ -272,6 +244,80 @@ final class RollStore: ObservableObject {
     }
     @Published var workspace: Workspace?
     @Published var status: String = ""
+    @Published private var persistenceWarnings: [String: String] = [:]
+    var displayedStatus: String {
+        let warning = persistenceWarnings.keys.sorted().compactMap { persistenceWarnings[$0] }.joined(separator: " · ")
+        if !warning.isEmpty { return warning }
+        if carrierMaskRequiresReinversion && !isProcessing {
+            return status.isEmpty || status == Self.carrierReinversionMessage
+                ? Self.carrierReinversionMessage : status + " · " + Self.carrierReinversionMessage
+        }
+        return status
+    }
+    @Published var rollMetadata = RollMetadata()
+    /// New imports start with carrier handling on. The Settings toggle records
+    /// this roll's choice; measurements change after a manual whole-roll rebuild.
+    @Published private(set) var carrierMaskEnabled = true
+    @Published private(set) var carrierMaskRequiresReinversion = false
+    private var appliedCarrierMaskEnabled = false
+    private static let carrierReinversionMessage =
+        "Carrier change pending — choose Settings → Re-invert Whole Roll to apply."
+
+    var canToggleCarrierMask: Bool {
+        guard !isProcessing, !isPresentingDialog, !frames.isEmpty,
+              let ws = workspace, Invert.loadSession(beside: ws.cache) != nil else { return false }
+        return !Self.captures(in: ws.captures).isEmpty
+    }
+
+    var automaticCarrierDescription: String {
+        guard let ws = workspace, !frames.isEmpty else { return "Open an imported roll to change carrier handling." }
+        if isProcessing { return "Finish or cancel processing before changing carrier handling." }
+        guard Invert.loadSession(beside: ws.cache) != nil,
+              !Self.captures(in: ws.captures).isEmpty else {
+            return "The original captures and a saved inversion are needed to change carrier handling."
+        }
+        if carrierMaskRequiresReinversion {
+            return "Selected: \(carrierMaskEnabled ? "On" : "Off"); current cache: \(appliedCarrierMaskEnabled ? "On" : "Off"). Re-invert Whole Roll to apply."
+        }
+        return "On by default for new imports. This roll's choice is saved; changes require Re-invert Whole Roll. Debug images are generated on demand."
+    }
+    @Published private(set) var exporting = false
+    @Published private(set) var isPresentingExport = false
+    @Published private(set) var isPresentingMetadata = false
+    @Published private(set) var isPresentingRoll = false
+    var isPresentingDialog: Bool { isPresentingExport || isPresentingMetadata || isPresentingRoll }
+    @Published private(set) var correctingColour = false
+    @Published private(set) var diagnosingBorders = false
+    var isProcessing: Bool { inverting || exporting || correctingColour || diagnosingBorders }
+    var canExport: Bool {
+        !frames.isEmpty && !isProcessing && !isPresentingDialog && !carrierMaskRequiresReinversion
+    }
+    var canEditRecentMetadata: Bool { !isProcessing && !isPresentingDialog }
+
+    private var dialogParentWindow: NSWindow? {
+        guard let app = NSApp, app.modalWindow == nil else { return nil }
+        guard let window = app.mainWindow ?? app.keyWindow
+            ?? app.windows.first(where: { $0.canBecomeMain && !($0 is NSPanel) }),
+              window.sheetParent == nil, window.attachedSheet == nil else { return nil }
+        return window
+    }
+
+    func cancelProcessing() {
+        inversionCancellation?.cancel()
+        exportCancellation?.cancel()
+        colourCancellation?.cancel()
+        diagnosticCancellation?.cancel()
+        status = "Cancelling processing…"
+    }
+    private var rollGeneration = UUID()
+    private var editGeneration = UUID()
+    private var loadRollTask: Task<Void, Never>?
+    private var inversionCancellation: RollCancellation?
+    private var exportCancellation: RollCancellation?
+    private var colourCancellation: RollCancellation?
+    private var diagnosticCancellation: RollCancellation?
+    private var restoringRoll = false
+    private var batchingEdits = false
     /// Copy / paste corrections between frames.
     @Published var clipboard: Edit?
 
@@ -308,7 +354,7 @@ final class RollStore: ObservableObject {
     /// which is the About box on the real machine too.
     @Published var showSplash = true
     /// DEV-RECENT
-    @Published var recents: [URL] = RollStore.loadRecents()
+    @Published var recents: [RecentRoll] = RollStore.loadRecentOrders()
 
 
     /// Undo history. One entry per USER ACTION, each holding every frame that
@@ -324,30 +370,46 @@ final class RollStore: ObservableObject {
     func mutate(_ indices: [Int]? = nil, _ change: (inout Edit) -> Void) {
         let idx = (indices ?? [selected]).filter { frames.indices.contains($0) }
         guard !idx.isEmpty else { return }
-        undoStack.append(idx.map { ($0, frames[$0].edit) })
-        if undoStack.count > Self.undoDepth { undoStack.removeFirst() }
-        redoStack.removeAll()
+        let before = idx.map { ($0, frames[$0].edit) }
+        batchingEdits = true
         for i in idx {
             var e = frames[i].edit
             change(&e)
             frames[i].edit = e
         }
+        batchingEdits = false
+        guard before.contains(where: { frames[$0.0].edit != $0.1 }) else { return }
+        undoStack.append(before)
+        if undoStack.count > Self.undoDepth { undoStack.removeFirst() }
+        redoStack.removeAll()
+        editGeneration = UUID()
+        saveEdits()
     }
 
     func undo() {
         guard let step = undoStack.popLast() else { status = "nothing to undo"; return }
-        redoStack.append(step.map { ($0.index, frames[$0.index].edit) })
-        for s in step where frames.indices.contains(s.index) { frames[s.index].edit = s.edit }
-        if let f = step.first { selected = f.index }
-        status = step.count == 1 ? "undo" : "undo — \(step.count) frames"
+        let valid = step.filter { frames.indices.contains($0.index) }
+        guard !valid.isEmpty else { return }
+        redoStack.append(valid.map { ($0.index, frames[$0.index].edit) })
+        batchingEdits = true
+        for s in valid { frames[s.index].edit = s.edit }
+        batchingEdits = false
+        selected = valid[0].index
+        editGeneration = UUID()
+        if saveEdits() { status = valid.count == 1 ? "undo" : "undo — \(valid.count) frames" }
     }
 
     func redo() {
         guard let step = redoStack.popLast() else { status = "nothing to redo"; return }
-        undoStack.append(step.map { ($0.index, frames[$0.index].edit) })
-        for s in step where frames.indices.contains(s.index) { frames[s.index].edit = s.edit }
-        if let f = step.first { selected = f.index }
-        status = step.count == 1 ? "redo" : "redo — \(step.count) frames"
+        let valid = step.filter { frames.indices.contains($0.index) }
+        guard !valid.isEmpty else { return }
+        undoStack.append(valid.map { ($0.index, frames[$0.index].edit) })
+        batchingEdits = true
+        for s in valid { frames[s.index].edit = s.edit }
+        batchingEdits = false
+        selected = valid[0].index
+        editGeneration = UUID()
+        if saveEdits() { status = valid.count == 1 ? "redo" : "redo — \(valid.count) frames" }
     }
 
     /// Hold to see the frame with no corrections at all.
@@ -372,6 +434,7 @@ final class RollStore: ObservableObject {
     /// Per-frame frame rectangles from session.json. Masks statistics; only
     /// export ever crops, and only if asked.
     private var frameRects: [String: Invert.Border] = [:]
+    private var carrierRects: [String: Invert.Border] = [:]
     /// Crop exports to the detected frame. OFF: borders are part of the picture
     /// unless you say otherwise, and the detection is not perfect.
     @Published var cropExport: Bool = UserDefaults.standard.bool(forKey: "cropExport") {
@@ -458,21 +521,19 @@ final class RollStore: ObservableObject {
     @Published private(set) var inverting = false
 
     private func updateSession(_ edit: (inout Invert.Session) -> Void) {
-        // Refuse rather than race. `Invert.run` rewrites this file wholesale when
-        // it finishes, so a write from here would either be lost or would undo the
-        // borders it just detected.
-        guard !inverting else {
-            status = "busy inverting — try that again when it finishes"
-            return
+        guard !restoringRoll else { return }
+        guard !inverting else { return }
+        guard let ws = workspace else { return }
+        do {
+            var session = try JSONDecoder().decode(Invert.Session.self, from: Data(contentsOf: ws.session))
+            edit(&session)
+            try RollPersistence.write(session, to: ws.session)
+            persistenceWarnings.removeValue(forKey: "session")
+        } catch {
+            persistenceWarnings["session"] = "Could not save roll settings: \(error.localizedDescription)"
         }
-        guard let ws = workspace,
-              let d = try? Data(contentsOf: ws.session),
-              var sess = try? JSONDecoder().decode(Invert.Session.self, from: d)
-        else { return }
-        edit(&sess)
-        let enc = JSONEncoder(); enc.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try? enc.encode(sess).write(to: ws.session)
     }
+
 
 
     /// Which print model renders the master. Empty = the built-in RA-4
@@ -483,6 +544,13 @@ final class RollStore: ObservableObject {
             applyPrintModel()
         }
     }
+
+    /// Menu capabilities follow the transforms actually used by the renderer.
+    /// A missing/rejected file path must not disable the built-in paper controls.
+    /// ICC has the same precedence here as in Master.outLinear/render16.
+    var usesICCPrintModel: Bool { Paper.outputICC != nil }
+    var usesPrintLUT: Bool { Paper.outputICC == nil && Paper.printLUT != nil }
+    var usesBuiltInPrintModel: Bool { Paper.outputICC == nil && Paper.printLUT == nil }
 
     func applyPrintModel() {
         if printLUTPath.isEmpty {
@@ -509,23 +577,16 @@ final class RollStore: ObservableObject {
         panel.prompt = "Use this LUT"
         panel.message = "Choose a .cube film-print LUT (Cineon log input)"
         if panel.runModal() == .OK, let u = panel.url {
-            // One print-model slot, one occupant -- and this direction was
-            // missing. `chooseICC` cleared the LUT but not the reverse, so
-            // loading a LUT over an ICC left BOTH set: the renderer took the LUT
-            // (it branches on it first) while `modelName` still named the ICC,
-            // and clearing the LUT silently brought the ICC back.
+            // Clear the previous ICC so the selected LUT becomes the sole
+            // print emulation, matching the renderer's ICC-first precedence.
             iccPath = ""
             printLUTPath = u.path
         }
     }
 
     // ============================== DEV-ICC ==============================
-    /// Path of the scanner ICC that replaces the whole render, or "" for off.
-    ///
-    /// A `scnr` profile has the entire rendering baked in -- inversion, balance
-    /// and grade together -- so this is not a stage in our pipeline, it REPLACES
-    /// it. Every correction goes inert while it is on, which the UI says out
-    /// loud rather than leaving you to wonder why the buttons do nothing.
+    /// External ICC print emulation, or an empty path for none. It replaces
+    /// the built-in paper conversion after the exposure and colour adjustments.
     @Published var iccPath: String = UserDefaults.standard.string(forKey: "iccOnly") ?? "" {
         didSet {
             UserDefaults.standard.set(iccPath, forKey: "iccOnly")
@@ -596,7 +657,7 @@ final class RollStore: ObservableObject {
         panel.allowsMultipleSelection = true
         panel.prompt = "Use as LCC"
         panel.message = "Choose the flat-field capture(s) — one per LED for a trichromatic rig"
-        panel.allowedContentTypes = [.tiff, .png]
+        panel.allowedContentTypes = [.tiff, .png, .rawImage]
         guard panel.runModal() == .OK, !panel.urls.isEmpty else { return }
         var files: [URL] = []
         for u in panel.urls {
@@ -605,7 +666,7 @@ final class RollStore: ObservableObject {
             if isDir.boolValue {
                 files += ((try? FileManager.default.contentsOfDirectory(at: u,
                             includingPropertiesForKeys: nil)) ?? [])
-                    .filter { ["tif", "tiff", "png"].contains($0.pathExtension.lowercased()) }
+                    .filter { CaptureDecoder.isSupported($0) }
             } else { files.append(u) }
         }
         lccPaths = files.sorted { $0.lastPathComponent < $1.lastPathComponent }.map(\.path)
@@ -624,147 +685,182 @@ final class RollStore: ObservableObject {
     /// A dropped folder: raw captures get inverted, already-inverted ones open.
     /// A dropped folder or file. Already inverted -> open. Raw captures -> invert.
     func accept(_ url: URL) {
+        guard !isPresentingDialog else { status = "Close the current dialog first"; return }
+        guard !inverting, !diagnosingBorders else { status = "Finish or cancel the current processing first"; return }
         var isDir: ObjCBool = false
-        let exists = FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
-        // A single dropped image: work in its parent folder.
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) else {
+            status = "This folder is no longer available"; return
+        }
         let dir = isDir.boolValue ? url : url.deletingLastPathComponent()
-
-        // DEV-RECENT: a folder that has gone must LEAVE the list, not be pushed
-        // back to the top of it. `recordRecent` ran before the attempt, so
-        // clicking a stale entry re-promoted a path that no longer existed and
-        // dead entries accumulated forever -- `loadRecents` filtered them out of
-        // the view but never wrote the filtered list back.
-        guard exists else {
-            RollStore.forgetRecent(dir)
-            recents = RollStore.loadRecents()
-            status = "\(dir.lastPathComponent) is no longer there — removed from Recent"
-            return
-        }
-
         let ws = Workspace(anyOf: dir)
-        if ws.hasMasters { recordRecent(dir); open(ws); return }
-
-        let exts: Set<String> = ["tif", "tiff", "png"]
-        let files = ((try? FileManager.default.contentsOfDirectory(at: ws.captures,
-                        includingPropertiesForKeys: nil)) ?? [])
-        // Legacy: masters sitting loose in the folder.
-        if files.contains(where: { $0.lastPathComponent.hasSuffix(".ntg.tif")
-                                || $0.lastPathComponent.hasSuffix("_cineon.tif") }) {
-            recordRecent(dir); openLoose(ws.captures); return
+        let captures = Self.captures(in: ws.captures)
+        if ws.hasMasters && (captures.isEmpty || CacheManifest.status(captures: ws.captures, cache: ws.cache) == .complete) {
+            open(ws); recordRecent(ws.captures); return
         }
-        if files.contains(where: { exts.contains($0.pathExtension.lowercased()) }) {
-            recordRecent(dir); newRoll(ws.captures); return
+        let files = (try? FileManager.default.contentsOfDirectory(at: ws.captures, includingPropertiesForKeys: nil)) ?? []
+        if files.contains(where: { $0.lastPathComponent.hasSuffix(".ntg.tif") ||
+                                   $0.lastPathComponent.hasSuffix("_cineon.tif") ||
+                                   $0.lastPathComponent.hasSuffix("_cineon.tiff") }) {
+            guard closeRoll() else { return }
+            openLoose(ws.captures); recordRecent(ws.captures); return
         }
-        // Recorded only on success, so a folder with nothing openable in it does
-        // not earn a place in the list either.
-        status = "Nothing to open in \(ws.captures.lastPathComponent)"
+        guard !captures.isEmpty else { status = "Nothing to open in \(ws.captures.lastPathComponent)"; return }
+        newRoll(ws.captures)
     }
 
-    /// Back to the idle window and its recent list. Edits are already saved on
-    /// every change, so there is nothing to flush -- but save once more anyway,
-    /// because losing corrections to a menu item nobody expected to be
-    /// destructive is not a trade worth making.
-    func closeRoll() {
-        guard !frames.isEmpty else { return }
-        saveEdits()
-        let name = workspace?.captures.lastPathComponent ?? "roll"
-        frames = []
-        selected = 0
-        workspace = nil          // before the resets below: see `updateSession`
-        frameRects = [:]
-        captureMode = .rgb3
-        monochrome = false
-        Paper.monochrome = false
-        recents = RollStore.loadRecents()      // DEV-RECENT: pick up this roll
-        status = "Closed \(name)"
+    @discardableResult
+    func closeRoll() -> Bool {
+        guard !isPresentingDialog else { status = "Close the current dialog first"; return false }
+        guard saveEdits() else { return false }
+        rollGeneration = UUID(); editGeneration = UUID()
+        loadRollTask?.cancel(); loadRollTask = nil
+        inversionCancellation?.cancel(); exportCancellation?.cancel(); colourCancellation?.cancel()
+        diagnosticCancellation?.cancel()
+        for frame in frames { frame.cancelLoad() }
+        showBefore = false
+        undoStack.removeAll(); redoStack.removeAll()
+        frames = []; selected = 0; workspace = nil
+        frameRects = [:]; carrierRects = [:]
+        persistenceWarnings.removeAll()
+        restoringRoll = true
+        captureMode = .rgb3; monochrome = false; carrierMaskEnabled = true
+        appliedCarrierMaskEnabled = false; carrierMaskRequiresReinversion = false
+        rollMetadata = RollMetadata()
+        restoringRoll = false
+        status = inverting ? "Cancelling processing…" : "Roll closed"
+        return true
     }
 
     func open(_ ws: Workspace) {
+        guard closeRoll() else { return }
         workspace = ws
-        // DEV-MONO: the roll's own properties, restored before anything renders.
-        // Re-invert reads captureMode rather than re-inspecting the files, so an
-        // operator's choice is not quietly overturned by a second guess.
-        //
-        // ASSIGNED UNCONDITIONALLY, defaults included. Restoring them only when
-        // the session decoded left them at the PREVIOUS roll's values, so a
-        // colour roll opened after a B&W one rendered black and white -- and the
-        // loose-master path (no session.json at all) always took that branch.
-        let sess = (try? Data(contentsOf: ws.session)).flatMap {
-            try? JSONDecoder().decode(Invert.Session.self, from: $0)
+        restoringRoll = true
+        let session = Invert.loadSession(beside: ws.cache)
+        frameRects = session?.frameBorders ?? [:]
+        carrierRects = session?.carrierBorders ?? [:]
+        captureMode = session.flatMap { Invert.Layout(rawValue: $0.layout) } ?? .rgb3
+        monochrome = session?.monochrome ?? false
+        appliedCarrierMaskEnabled = session?.carrierMaskEnabled ?? false
+        carrierMaskEnabled = session?.pendingCarrierMaskEnabled ?? appliedCarrierMaskEnabled
+        carrierMaskRequiresReinversion = session?.pendingCarrierMaskEnabled != nil
+        lccPaths = session?.lcc ?? []
+        do { rollMetadata = try RollPersistence.loadMetadata(from: ws.metadata) }
+        catch { persistenceWarnings["metadata"] = "Photographic metadata is unreadable — the file has been preserved" }
+        if rollMetadata.title.isEmpty { rollMetadata.title = ws.captures.lastPathComponent }
+        restoringRoll = false
+        openLoose(ws.cache, keepWorkspace: true)
+    }
+
+    func editRollDetails() {
+        guard !isPresentingDialog else { return }
+        guard !isProcessing, let ws = workspace else { status = "Open a roll and finish processing first"; return }
+        guard let parent = dialogParentWindow else { return }
+        let generation = rollGeneration
+        isPresentingRoll = true
+        Task { @MainActor in
+            let choice = await RollDialogs.presentRollSettings(folder: ws.captures,
+                captureCount: Self.captures(in: ws.captures).count, suggestedLayout: captureMode,
+                suggestedMonochrome: monochrome, metadata: rollMetadata, for: parent)
+            isPresentingRoll = false
+            guard generation == rollGeneration, let choice else { return }
+            applyRollSettings(choice, to: ws)
         }
-        frameRects = sess?.frameBorders ?? [:]
-        captureMode = sess.flatMap { Invert.Layout(rawValue: $0.layout) } ?? .rgb3
-        monochrome = sess?.monochrome ?? false
-        Paper.monochrome = monochrome
-        // RESTORE THE FLAT THE ROLL WAS INVERTED WITH.
-        //
-        // `lccPaths` is app-wide, so re-inverting a roll used whatever flat happened
-        // to be selected -- or none. The session records what was actually used, so a
-        // re-invert can reproduce the roll instead of quietly making a different one.
-        // This is how a roll made with a flat stopped matching itself after the bundle
-        // rename reset UserDefaults and the selection went empty.
-        //
-        // Only when the session names files that still exist; otherwise the current
-        // selection is left alone, because one flat per session reused across rolls
-        // is the intended workflow.
-        if let recorded = sess?.lcc, !recorded.isEmpty {
-            let live = recorded.filter { FileManager.default.fileExists(atPath: $0) }
-            if live.count == recorded.count {
-                if lccPaths != live { lccPaths = live }
-            } else {
-                status = "This roll was inverted with a flat that is no longer at "
-                       + "\(recorded.first ?? "?") — re-select it before re-inverting"
+    }
+
+    private func applyRollSettings(_ choice: RollImportOptions, to ws: Workspace) {
+        do {
+            try RollPersistence.saveMetadata(choice.metadata, to: ws.metadata)
+            persistenceWarnings.removeValue(forKey: "metadata")
+        }
+        catch { persistenceWarnings["metadata"] = "Could not save roll metadata: \(error.localizedDescription)"; return }
+        let captureChanged = captureMode != choice.layout
+        rollMetadata = choice.metadata
+        refreshRecents()
+        captureMode = choice.layout; monochrome = choice.monochrome
+        status = captureChanged ? "Roll details saved — re-invert to apply capture changes" : "Roll details saved"
+    }
+
+    /// Edit a recent order without opening its images or changing the active roll.
+    func editRecentMetadata(_ folder: URL) {
+        guard canEditRecentMetadata else { return }
+        guard let parent = NSApp.keyWindow ?? NSApp.mainWindow,
+              parent.sheetParent == nil, parent.attachedSheet == nil,
+              NSApp.modalWindow == nil else { return }
+        let target = Workspace(anyOf: folder)
+        let metadata: RollMetadata
+        do { metadata = try RollPersistence.loadMetadata(from: target.metadata) }
+        catch {
+            let alert = NSAlert()
+            alert.messageText = "Roll metadata could not be opened"
+            alert.informativeText = error.localizedDescription
+            alert.addButton(withTitle: "OK")
+            isPresentingMetadata = true
+            alert.beginSheetModal(for: parent) { [weak self] _ in
+                self?.isPresentingMetadata = false
+            }
+            return
+        }
+        isPresentingMetadata = true
+        Task { @MainActor in
+            defer { isPresentingMetadata = false }
+            await RollDialogs.presentMetadata(folder: target.captures, metadata: metadata,
+                                               for: parent) { updated in
+                try self.saveRecentMetadata(updated, for: target.captures)
             }
         }
-        openLoose(ws.cache, keepWorkspace: true)
+    }
+
+    /// Persist photographic details only. Cache, inversion settings and edits
+    /// are deliberately outside this operation, including for legacy workspaces.
+    func saveRecentMetadata(_ metadata: RollMetadata, for folder: URL) throws {
+        let target = Workspace(anyOf: folder)
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: target.captures.path, isDirectory: &isDirectory),
+              isDirectory.boolValue else { throw Err("This roll folder is no longer available.") }
+        try RollPersistence.saveMetadata(metadata, to: target.metadata)
+        if workspace?.captures.standardizedFileURL.resolvingSymlinksInPath().path
+            == target.captures.standardizedFileURL.resolvingSymlinksInPath().path {
+            rollMetadata = metadata
+            persistenceWarnings.removeValue(forKey: "metadata")
+        }
+        refreshRecents()
+        status = "Roll metadata saved"
     }
 
     /// `edits.json` lives in the workspace beside the RAW CAPTURES, one per roll,
     /// holding every frame's corrections. A few hundred bytes, and it survives
     /// deleting the 1.9 GB cache.
     private func loadEdits() {
-        guard let ws = workspace,
-              let d = try? Data(contentsOf: ws.edits),
-              let map = try? JSONDecoder().decode([String: Edit].self, from: d) else { return }
-        for f in frames { if let e = map[f.name] { f.edit = e } }
+        guard let ws = workspace, FileManager.default.fileExists(atPath: ws.edits.path) else { return }
+        do {
+            let map = try JSONDecoder().decode([String: Edit].self, from: Data(contentsOf: ws.edits))
+            batchingEdits = true
+            for frame in frames { if let edit = map[frame.name] { frame.edit = edit } }
+            batchingEdits = false
+            persistenceWarnings.removeValue(forKey: "edits")
+        } catch { persistenceWarnings["edits"] = "edits.json is unreadable — preserved for recovery" }
     }
 
-    func saveEdits() {
-        guard let ws = workspace else { return }
-        // MERGED with what is on disk, not rebuilt from `frames`.
-        //
-        // `frames` holds only the masters currently in the cache, so rebuilding
-        // from it deleted the corrections of every frame that was not loaded --
-        // after a `--only` re-invert, or when the cache is opened before every
-        // master exists. loadEdits assigns into FrameItem.edit, whose didSet calls
-        // this, so the loss happened at OPEN and was permanent.
-        // REFUSE to write over a file we cannot read. Otherwise an unparseable
-        // edits.json becomes an empty merge, every frame looks neutral, and the
-        // branch below deletes it -- turning a recoverable file into no file.
-        let onDisk = try? Data(contentsOf: ws.edits)
-        var map: [String: Edit] = [:]
-        if let onDisk {
-            guard let decoded = try? JSONDecoder().decode([String: Edit].self, from: onDisk)
-            else {
-                status = "edits.json is unreadable — leaving it alone"
-                return
+    @discardableResult
+    func saveEdits() -> Bool {
+        guard !batchingEdits, !restoringRoll, let ws = workspace else { return true }
+        do {
+            var map: [String: Edit] = [:]
+            if FileManager.default.fileExists(atPath: ws.edits.path) {
+                map = try JSONDecoder().decode([String: Edit].self, from: Data(contentsOf: ws.edits))
             }
-            map = decoded
+            for frame in frames {
+                if frame.edit.isNeutral { map.removeValue(forKey: frame.name) }
+                else { map[frame.name] = frame.edit }
+            }
+            if map.isEmpty && !FileManager.default.fileExists(atPath: ws.edits.path) { return true }
+            try RollPersistence.write(map, to: ws.edits)
+            persistenceWarnings.removeValue(forKey: "edits")
+            return true
+        } catch {
+            persistenceWarnings["edits"] = "Could not save edits; existing file preserved: \(error.localizedDescription)"
+            return false
         }
-        // In name order so a later duplicate wins, as `uniquingKeysWith` did:
-        // `name` strips both "_cineon" and ".ntg", so two files can collide.
-        for f in frames {
-            if f.edit.isNeutral { map.removeValue(forKey: f.name) } else { map[f.name] = f.edit }
-        }
-        if map.isEmpty {
-            try? FileManager.default.removeItem(at: ws.edits)   // don't litter clean rolls
-            return
-        }
-        try? ws.makeDirs()
-        let enc = JSONEncoder()
-        enc.outputFormatting = [.prettyPrinted, .sortedKeys]
-        guard let d = try? enc.encode(map) else { return }
-        try? d.write(to: ws.edits)
     }
 
     func openLoose(_ dir: URL, keepWorkspace: Bool = false) {
@@ -782,25 +878,36 @@ final class RollStore: ObservableObject {
             // Legacy loose masters, no session.json: the roll's properties are
             // unknown, so they must be DEFAULTED rather than inherited from
             // whatever was open before.
-            workspace = Workspace(anyOf: dir)
+            let ws = Workspace(anyOf: dir)
+            workspace = ws
             captureMode = .rgb3
             monochrome = false
             Paper.monochrome = false
+            do { rollMetadata = try RollPersistence.loadMetadata(from: ws.metadata) }
+            catch { persistenceWarnings["metadata"] = "Photographic metadata is unreadable — the file has been preserved" }
+            if rollMetadata.title.isEmpty { rollMetadata.title = ws.captures.lastPathComponent }
         }
-        frames = urls.map(FrameItem.init)
+        loadRollTask?.cancel()
+        for frame in frames { frame.cancelLoad() }
+        undoStack.removeAll(); redoStack.removeAll()
+        let expected = CacheManifest.read(cache: dir).map { Set($0.expected) }
+        frames = urls.filter { expected?.contains(FrameItem.stem(of: $0)) ?? true }.map(FrameItem.init)
         // DEV-GATE: the detector gate always, plus the pooled-profile one when
         // the flag is on. Union, so it can only ever exclude more.
         let detector = Invert.Border.gate(of: frameRects)
         let gate = detector
         for f in frames {
-            f.onEdit = { [weak self] in self?.saveEdits() }
+            f.onEdit = { [weak self] in
+                guard let self, !self.batchingEdits else { return }
+                self.editGeneration = UUID(); self.saveEdits()
+            }
             f.frameRect = frameRects[f.name]
-            f.statsGate = gate
+            f.statsGate = statisticsGate(for: f.name, base: gate)
         }
         selected = 0
         status = "\(frames.count) frames ready"
         loadEdits()
-        Task { await loadAll() }
+        loadRollTask = Task { await loadAll() }
     }
 
     /// Load the roll, SELECTED FRAME FIRST and then a few at a time.
@@ -813,26 +920,36 @@ final class RollStore: ObservableObject {
     ///
     /// Three at a time, matching the inverter: each load holds a 180 MB source
     /// buffer while it decimates, so this is bandwidth bound too.
+    private func statisticsGate(for name: String, base: Invert.Border? = nil) -> Invert.Border {
+        let gate = base ?? Invert.Border.gate(of: frameRects)
+        guard appliedCarrierMaskEnabled, let extra = carrierRects[name] else { return gate }
+        return .init(left: max(gate.left, extra.left), top: max(gate.top, extra.top),
+                     right: max(gate.right, extra.right), bottom: max(gate.bottom, extra.bottom))
+    }
+
     private func loadAll() async {
-        let order = [selected] + frames.indices.filter { $0 != selected }
-        let items = order.map { frames[$0] }        // hoisted: the group body is nonisolated
-        var loaded = 0
-        var cursor = 0
+        let generation = rollGeneration
+        let order = frames.indices.contains(selected) ? [selected] + frames.indices.filter { $0 != selected } : Array(frames.indices)
+        let items = order.map { frames[$0] }
+        var loaded = 0, cursor = 0
         await withTaskGroup(of: Void.self) { group in
             while cursor < items.count, cursor < 3 {
-                let f = items[cursor]; cursor += 1
-                group.addTask { await f.loadIfNeeded() }
+                let frame = items[cursor]; cursor += 1
+                group.addTask { await frame.loadIfNeeded() }
             }
             while await group.next() != nil {
+                guard !Task.isCancelled, generation == rollGeneration else { group.cancelAll(); return }
                 loaded += 1
                 status = "reading \(loaded) of \(items.count)…"
                 if cursor < items.count {
-                    let f = items[cursor]; cursor += 1
-                    group.addTask { await f.loadIfNeeded() }
+                    let frame = items[cursor]; cursor += 1
+                    group.addTask { await frame.loadIfNeeded() }
                 }
             }
         }
-        status = "\(frames.count) frames ready"
+        guard !Task.isCancelled, generation == rollGeneration else { return }
+        let failed = items.filter { !$0.loaded }.count
+        status = failed == 0 ? "\(frames.count) frames ready" : "\(failed) frames could not load — select a frame to retry"
     }
 
     func select(_ i: Int) { if frames.indices.contains(i) { selected = i } }
@@ -854,7 +971,7 @@ final class RollStore: ObservableObject {
     func rotateAll(_ turns: Int = 1) {
         mutate(Array(frames.indices)) { $0.quarterTurns = ($0.quarterTurns + turns) % 4 }
     }
-    func resetColour() { mutate { $0.cyan = 0; $0.magenta = 0; $0.yellow = 0 } }
+    func resetColour() { mutate { $0.cyan = 0; $0.magenta = 0; $0.yellow = 0; $0.autoCyan = 0; $0.autoMagenta = 0; $0.autoYellow = 0 } }
     func resetDensity() { mutate { $0.density = 0 } }
     func setHigh(_ g: Paper.Grade) { mutate { $0.high = g } }
     func setShadow(_ g: Paper.Grade) { mutate { $0.shadow = g } }
@@ -865,9 +982,8 @@ final class RollStore: ObservableObject {
     }
 
     // ============================== DEV-CURVE ==============================
-    /// Shoulder on every contrast path, Contrast one step longer at the top, and
-    /// DRANGE reduced to the wide endpoints. Behind a flag so it comes out in one
-    /// line if it is not wanted; off reproduces today byte-for-byte.
+    /// The shouldered curve is the standard default. Its older contrast behavior
+    /// remains available as a regular Curve preference.
     /// EVERY DEFAULT THAT MIRRORS INTO A `Paper` GLOBAL IS PUSHED HERE, ONCE.
     ///
     /// `didSet` does not fire for a property's initial value, so a mirrored
@@ -913,102 +1029,142 @@ final class RollStore: ObservableObject {
         }
     }
 
-    @Published var newCurve: Bool = UserDefaults.standard.bool(forKey: "newCurve") {
+    @Published var newCurve: Bool =
+        (UserDefaults.standard.object(forKey: "newCurve") as? Bool) ?? true {
         didSet {
             UserDefaults.standard.set(newCurve, forKey: "newCurve")
             Paper.newCurve = newCurve
-            // A stored +3 is out of range with the flag off, so pull it back --
-            // otherwise turning the flag off would leave frames on a setting the
-            // panel cannot show or undo.
-            if !newCurve {
-                let over = frames.indices.filter { frames[$0].edit.gradation > 2 }
-                if !over.isEmpty {
-                    mutate(over) { $0.gradation = 2 }
-                }
-            }
+            // Redraw with the chosen curve; toneSlopes limits the legacy range
+            // without rewriting the frame's saved contrast adjustment.
             for f in frames { f.refresh() }
             status = newCurve ? "Contrast: shouldered curve, DRANGE = range only"
-                              : "Contrast: as shipped"
+                              : "Contrast: legacy curve"
         }
     }
     // =======================================================================
-    // ============================== DEV-CAST ==============================
-    /// The ROLL's residual colour cast, in key presses. A METER: it reports, and
-    /// `applyRollCast` is a separate, explicit action.
-    ///
-    /// WHY THE ROLL AND NOT THE FRAME. Measured over both rolls, pooling
-    /// near-neutral pixels (`FrameItem.neutralSample`):
-    ///
-    ///                  roll cast            per-frame scatter (sd)
-    ///   markesteijn   -1.3 / -2.3 keys        1.7 / 2.2 keys
-    ///   new-captures  +1.8 / +0.7 keys        2.4 / 1.8 keys
-    ///
-    /// The per-frame scatter is as large as the cast itself, so a per-frame
-    /// reading cannot separate rig cast from scene colour -- which is the same
-    /// conclusion the seven deleted AWB mechanisms reached. Pooling the roll
-    /// divides that scatter by sqrt(n): 37 frames puts the roll figure inside
-    /// about +-0.3 keys, which is worth acting on.
-    ///
-    /// It is roll-level, and that does not break "every frame is its own world":
-    /// nothing here feeds the render. It hands the operator a number, the same way
-    /// a lab analyser did, and the operator decides. `hold()` and `pasteAll()` are
-    /// already roll-wide manual actions of exactly this kind.
-    ///
-    /// Weighted by vote count, so a saturated frame with 1.5% near-neutral mass
-    /// barely counts against a flat one with 54%.
-    func measureRollCast() -> (c: Int, m: Int, y: Int, frames: Int, mass: Double)? {
-        guard !frames.isEmpty else { return nil }
-        let term = Master.Terminator.current
-        var sr = 0.0, sg = 0.0, sb = 0.0, tot = 0, used = 0, pix = 0
-        for f in frames {
-            guard let s = f.neutralSample(term) else { continue }
-            let wgt = Double(s.n)
-            sr += s.r * wgt; sg += s.g * wgt; sb += s.b * wgt
-            tot += s.n; used += 1; pix += s.n
+    func correctRollColour() {
+        guard !carrierMaskRequiresReinversion else { status = Self.carrierReinversionMessage; return }
+        guard !isProcessing, !frames.isEmpty else { status = "Open a roll and finish processing first"; return }
+        guard !monochrome else { status = "Colour correction is unavailable for black-and-white film"; return }
+        let generation = rollGeneration, edits = editGeneration, cancellation = RollCancellation()
+        colourCancellation = cancellation; correctingColour = true
+        let items = frames
+        status = "Preparing roll colour samples…"
+        Task {
+            for frame in items {
+                if cancellation.isCancelled { break }
+                await frame.loadIfNeeded()
+            }
+            guard !cancellation.isCancelled, generation == rollGeneration else {
+                if colourCancellation === cancellation { correctingColour = false }; return
+            }
+            guard edits == editGeneration, items.allSatisfy({ $0.loaded }) else {
+                correctingColour = false; status = "Finish loading and editing, then run colour correction again"; return
+            }
+            let input = items.compactMap { $0.colourInput() }, term = Master.Terminator.current
+            let signature = renderSignature
+            status = "Correcting roll colour…"
+            let result = await Task.detached(priority: .userInitiated) {
+                RollColourCorrection.estimate(input, term: term, cancelled: { cancellation.isCancelled })
+            }.value
+            guard colourCancellation === cancellation else { return }
+            correctingColour = false
+            guard !cancellation.isCancelled, generation == rollGeneration,
+                  edits == editGeneration, signature == renderSignature else {
+                if generation == rollGeneration { status = "The roll changed; run colour correction again" }; return
+            }
+            guard let result else { status = "Not enough consistent neutral evidence — colour unchanged"; return }
+            mutate(Array(frames.indices)) {
+                $0.autoCyan = result.cyan; $0.autoMagenta = result.magenta; $0.autoYellow = result.yellow
+            }
+            status = String(format: "Roll colour C%+.1f M%+.1f Y%+.1f — %d frames, %.0f%% evidence · Undo to revert",
+                            result.cyan, result.magenta, result.yellow, result.frames, result.fraction * 100)
         }
-        guard used > 0, tot > 0 else { return nil }
-        let r = sr / Double(tot), g = sg / Double(tot), b = sb / Double(tot)
-        let mean = (r + g + b) / 3
-        // A key lowers its own channel. Measured through the ICC at the 5% step,
-        // one key moves a channel about 2.4 output codes -- one constant, not a
-        // per-channel calibration, so re-measuring after applying is the honest
-        // way to converge. It normally takes one round.
-        let perKey = 2.4
-        func keys(_ v: Double) -> Int { Int(((v - mean) / perKey).rounded()) }
-        return (c: keys(r), m: keys(g), y: keys(b), frames: used,
-                mass: Double(pix) / Double(max(tot, 1)))
     }
 
-    /// Dial the measured cast onto every frame. Explicit, undoable, and additive —
-    /// so measuring again reports what is LEFT, not the same number twice.
-    func applyRollCast() {
-        guard let k = measureRollCast() else {
-            status = "not enough near-neutral pixels to measure a cast"
-            return
-        }
-        guard k.c != 0 || k.m != 0 || k.y != 0 else {
-            status = "roll is already neutral to within a key"
-            return
-        }
-        mutate(Array(frames.indices)) {
-            $0.cyan = ($0.cyan + k.c).clamped(Paper.cmyRange)
-            $0.magenta = ($0.magenta + k.m).clamped(Paper.cmyRange)
-            $0.yellow = ($0.yellow + k.y).clamped(Paper.cmyRange)
-        }
-        status = "applied C\(Edit.keyLabel(k.c)) M\(Edit.keyLabel(k.m)) "
-            + "Y\(Edit.keyLabel(k.y)) to all \(frames.count) frames"
+    private var renderSignature: String {
+        "\(iccPath)|\(printLUTPath)|\(monochrome)|\(newCurve)|\(highlightRolloff)|\(printContrast)"
     }
 
-    func reportRollCast() {
-        guard let k = measureRollCast() else {
-            status = "not enough near-neutral pixels to measure a cast"
-            return
+    func toggleCarrierMask() {
+        guard canToggleCarrierMask, let ws = workspace else {
+            status = automaticCarrierDescription; return
         }
-        status = "roll cast C\(Edit.keyLabel(k.c)) M\(Edit.keyLabel(k.m)) "
-            + "Y\(Edit.keyLabel(k.y))  (\(k.frames) frames, "
-            + String(format: "%.0f%% neutral mass)", k.mass * 100)
+        do {
+            var session = try JSONDecoder().decode(Invert.Session.self,
+                                                    from: Data(contentsOf: ws.session))
+            let requested = !carrierMaskEnabled
+            let needsRebuild = requested != session.carrierMaskEnabled
+                || CacheManifest.status(captures: ws.captures, cache: ws.cache) != .complete
+            session.pendingCarrierMaskEnabled = needsRebuild ? requested : nil
+            try RollPersistence.write(session, to: ws.session)
+            carrierMaskEnabled = requested
+            carrierMaskRequiresReinversion = needsRebuild
+            persistenceWarnings.removeValue(forKey: "session")
+            status = needsRebuild ? Self.carrierReinversionMessage : "Pending carrier change cleared"
+            RollStore.onRollProps?()
+        } catch {
+            persistenceWarnings["session"] = "Could not save carrier setting: \(error.localizedDescription)"
+        }
     }
-    // ======================================================================
+
+    var hasBorderDebugImages: Bool {
+        guard let folder = workspace?.borderDebug,
+              let reports = try? FileManager.default.contentsOfDirectory(at: folder,
+                  includingPropertiesForKeys: nil, options: .skipsHiddenFiles) else { return false }
+        return reports.contains { $0.lastPathComponent.hasPrefix("border-debug-") }
+    }
+
+    func showBorderDebugImages() {
+        guard let folder = workspace?.borderDebug, hasBorderDebugImages else {
+            status = "Choose Settings → Generate Border Debug Images first"; return
+        }
+        NSWorkspace.shared.open(folder)
+    }
+
+    /// Rerun detection for inspection without changing the applied measurements.
+    func generateBorderDebugImages() {
+        guard !isProcessing, let ws = workspace else {
+            status = "Open a roll and finish processing first"; return
+        }
+        let generation = rollGeneration, layout = captureMode, cancellation = RollCancellation()
+        diagnosticCancellation = cancellation; diagnosingBorders = true
+        status = "Analyzing borders and repeated carrier geometry…"
+        RollStore.onRollProps?()
+        Task.detached(priority: .userInitiated) {
+            do {
+                let report = try Invert.writeBorderDiagnostics(dir: ws.captures, layout: layout,
+                    out: ws.cache, destination: ws.borderDebug,
+                    cancellation: { cancellation.isCancelled },
+                    progress: { message in
+                        Task { @MainActor in
+                            if generation == self.rollGeneration,
+                               self.diagnosticCancellation === cancellation,
+                               !cancellation.isCancelled { self.status = message }
+                        }
+                    })
+                await MainActor.run {
+                    guard self.diagnosticCancellation === cancellation else { return }
+                    self.diagnosingBorders = false; self.diagnosticCancellation = nil
+                    RollStore.onRollProps?()
+                    guard generation == self.rollGeneration, !cancellation.isCancelled else { return }
+                    self.status = report.summary
+                    if !NSWorkspace.shared.open(report.preview) {
+                        NSWorkspace.shared.activateFileViewerSelecting([report.preview])
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    guard self.diagnosticCancellation === cancellation else { return }
+                    self.diagnosingBorders = false; self.diagnosticCancellation = nil
+                    RollStore.onRollProps?()
+                    guard generation == self.rollGeneration else { return }
+                    self.status = cancellation.isCancelled ? "Border analysis cancelled"
+                        : "Border analysis stopped: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
 
     // ============================== DEV-REVIEW ==============================
     /// The consistency pass: N frames at judgeable size instead of one big
@@ -1056,208 +1212,200 @@ final class RollStore: ObservableObject {
     }
 
     func exportAll(selectedOnly: Bool = false) {
-        let tiff = wantTIFF, jpeg = wantJPEG, cropped = cropExport
-        guard tiff || jpeg else {
-            status = "No export format selected — see Settings in the menu bar"; return
-        }
+        guard !isPresentingDialog else { return }
+        guard !carrierMaskRequiresReinversion else { status = Self.carrierReinversionMessage; return }
+        guard !isProcessing else { status = "Finish current processing first"; return }
         let chosen = selectedOnly ? (current.map { [$0] } ?? []) : frames
         guard !chosen.isEmpty else { status = "Nothing to export"; return }
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.prompt = "Export here"
-        panel.message = selectedOnly ? "Export this frame" : "Export \(chosen.count) frames"
-        guard panel.runModal() == .OK, let dir = panel.url else { return }
-        let jobs = chosen.map { ($0, $0.edit, $0.frameRect, $0.statsGate) }
-        // Snapshot the print terminator HERE, on the main actor, so the whole
-        // batch renders through one of them even if the menu changes mid-export.
-        let term = Master.Terminator.current
+        guard let parent = NSApp.keyWindow ?? NSApp.mainWindow,
+              parent.sheetParent == nil, parent.attachedSheet == nil,
+              NSApp.modalWindow == nil else {
+            status = "Close the current dialog before exporting"; return
+        }
+        let names = chosen.map { $0.name + ".tif" }
+        let generation = rollGeneration, metadata = rollMetadata
+        let numbers = selectedOnly ? [selected + 1] : nil
+        isPresentingExport = true
+        // Leave the SwiftUI button action before displaying either sheet. A
+        // nested runModal here blocks the UI updates made by export controls.
+        Task { @MainActor in
+            let request = await RollDialogs.presentExport(metadata: metadata, originalNames: names,
+                wantTIFF: wantTIFF, wantJPEG: wantJPEG, cropExport: cropExport,
+                frameNumbers: numbers, for: parent)
+            isPresentingExport = false
+            guard generation == rollGeneration, let request else { return }
+            guard !isProcessing, !carrierMaskRequiresReinversion else {
+                status = "The roll changed while choosing export options; open Export again"; return
+            }
+            startExport(request, frames: chosen, originalNames: names)
+        }
+    }
+
+    private func startExport(_ request: ExportRequest, frames chosen: [FrameItem],
+                             originalNames names: [String]) {
+        let dir: URL
+        do { dir = try request.prepareDestination(originalNames: names) }
+        catch { status = error.localizedDescription; return }
+        wantTIFF = request.wantTIFF; wantJPEG = request.wantJPEG; cropExport = request.cropExport
+        let jobs = chosen.enumerated().map { index, frame in
+            (frame, frame.edit, frame.frameRect, frame.statsGate,
+             request.stem(for: request.frameNumber(at: index), originalName: names[index]))
+        }
+        let term = Master.Terminator.current, metadata = request.metadata.imageProperties
+        let generation = rollGeneration, cancellation = RollCancellation()
+        exportCancellation = cancellation; exporting = true
         status = "exporting 0/\(jobs.count)…"
         Task.detached(priority: .userInitiated) {
-            for (n, job) in jobs.enumerated() {
-                do { try job.0.export(job.1, frame: job.2, gate: job.3, to: dir,
-                                      tiff: tiff, jpeg: jpeg,
-                                      cropToFrame: cropped, term: term) }
-                catch {
-                    let m = error.localizedDescription
-                    await MainActor.run { self.status = "export failed: \(m)" }
-                    return
+            do {
+                for (index, job) in jobs.enumerated() {
+                    if cancellation.isCancelled { throw CancellationError() }
+                    try job.0.export(job.1, frame: job.2, gate: job.3, to: dir,
+                        tiff: request.wantTIFF, jpeg: request.wantJPEG, cropToFrame: request.cropExport,
+                        term: term, outputStem: job.4, metadata: metadata)
+                    await MainActor.run {
+                        if generation == self.rollGeneration { self.status = "exporting \(index + 1)/\(jobs.count)…" }
+                    }
                 }
-                await MainActor.run { self.status = "exporting \(n + 1)/\(jobs.count)…" }
-            }
-            await MainActor.run {
-                self.status = "exported \(jobs.count) frames to \(dir.lastPathComponent)"
+                await MainActor.run {
+                    self.exporting = false
+                    if generation == self.rollGeneration { self.status = "exported \(jobs.count) frames to \(dir.lastPathComponent)" }
+                }
+            } catch {
+                await MainActor.run {
+                    self.exporting = false
+                    if generation == self.rollGeneration { self.status = "Export stopped: \(error.localizedDescription)" }
+                }
             }
         }
     }
 
-    /// Pick a folder of RAW CAPTURES, invert them, and open the result. No
-    /// terminal, no layout question: the file shapes determine the layout.
     func newRoll(_ folder: URL? = nil) {
-        // One inversion at a time -- reachable from the menu, the idle screen and
-        // a drop, so the guard belongs here rather than at each caller.
-        guard !inverting else { status = "already inverting"; return }
-        let dir: URL
-        var pick: RollPicker? = nil
-        if let folder { dir = folder } else {
-            let panel = NSOpenPanel()
-            panel.canChooseDirectories = true
-            panel.canChooseFiles = false
-            panel.prompt = "Invert this roll"
-            panel.message = "Choose a folder of raw captures"
-            let p = attachRollPicker(panel)
-            guard panel.runModal() == .OK, let u = panel.url else { return }
-            pick = p; dir = u
+        guard !isPresentingDialog else { status = "Close the current dialog first"; return }
+        guard !isProcessing else { status = "Finish current processing first"; return }
+        guard let parent = dialogParentWindow else { return }
+        let generation = rollGeneration
+        isPresentingRoll = true
+        Task { @MainActor in
+            defer { isPresentingRoll = false }
+            let dir: URL
+            if let folder { dir = folder } else {
+                let chooser = NSOpenPanel()
+                chooser.canChooseDirectories = true
+                chooser.canChooseFiles = false
+                chooser.prompt = "Choose roll"
+                let response: NSApplication.ModalResponse = await withCheckedContinuation { continuation in
+                    chooser.beginSheetModal(for: parent) { continuation.resume(returning: $0) }
+                }
+                chooser.orderOut(nil)
+                guard response == .OK, let url = chooser.url else { return }
+                dir = url
+            }
+            let ws = Workspace(anyOf: dir), urls = Self.captures(in: dir)
+            guard !urls.isEmpty else { status = "No supported captures found"; return }
+            let saved = Invert.loadSession(beside: ws.cache), suggestion = Invert.suggestLayout(urls)
+            let metadata: RollMetadata
+            do { metadata = try RollPersistence.loadMetadata(from: ws.metadata) }
+            catch { status = "Roll metadata cannot be read; metadata.json has been preserved"; return }
+            guard let choice = await RollDialogs.presentImport(folder: dir, captureCount: urls.count,
+                suggestedLayout: saved.flatMap { Invert.Layout(rawValue: $0.layout) } ?? suggestion?.layout ?? .rgb1,
+                suggestedMonochrome: saved?.monochrome ?? suggestion?.monochrome ?? false,
+                metadata: metadata, for: parent), generation == rollGeneration else { return }
+            guard !Invert.group(urls, layout: choice.layout).isEmpty else {
+                status = Invert.groupIssue ?? "Captures cannot be grouped with this mode"; return
+            }
+            guard saveEdits() else { return }
+            do { try RollPersistence.saveMetadata(choice.metadata, to: ws.metadata) }
+            catch { status = "Could not save roll metadata: \(error.localizedDescription)"; return }
+            // End the dialog guard before intentionally replacing the active roll.
+            isPresentingRoll = false
+            guard closeRoll() else { return }
+            restoringRoll = true
+            captureMode = choice.layout; monochrome = choice.monochrome
+            rollMetadata = choice.metadata
+            restoringRoll = false
+            let flats = saved.map { $0.lcc.map { URL(fileURLWithPath: $0) } } ?? lccURLs
+            startInversion(ws, layout: choice.layout, monochrome: choice.monochrome,
+                           carrier: true, lcc: flats, only: nil)
         }
+    }
 
-        // LCC/flat captures EXCLUDED, as the inverter excludes them. Counting a
-        // flat changed the file count's parity, which is what decides one-shot
-        // from three-shot, so a single flat in the folder flipped the layout.
-        let urls = Self.captures(in: dir)
-        guard !urls.isEmpty else {
-            status = "No captures found in \(dir.lastPathComponent)"; return
+    func reinvert(selectedOnly: Bool) {
+        guard !isProcessing, let ws = workspace else { status = "Open a roll and finish processing first"; return }
+        guard !selectedOnly || !carrierMaskRequiresReinversion else {
+            status = Self.carrierReinversionMessage; return
         }
-        // Close the previous roll BEFORE assigning any roll property: the
-        // `monochrome` didSet persists to the open roll's session.json.
-        closeRoll()
-        if let pick {
-            applyRollPicker(pick, folder: dir)
-        } else if let s = Invert.suggestLayout(urls) {
-            // A dropped folder never saw the picker, so seed it from the files.
-            captureMode = s.layout
-            monochrome = s.monochrome
-            Paper.monochrome = monochrome
-        }
-        let layout = captureMode
-        let ws = Workspace(anyOf: dir)
-        // Snapshot main-actor settings before the detached task, not inside it.
-        let lcc = lccURLs
-        let bw = monochrome
-        frames = []
-        status = "inverting \(urls.count) captures as \(layout.rawValue)…"
-        inverting = true
+        let only: Set<String>? = selectedOnly ? current.map { Set([$0.name]) } : nil
+        if selectedOnly && only == nil { return }
+        guard saveEdits() else { return }
+        // A selected-frame rebuild keeps the existing roll's measurement recipe.
+        // A manually requested whole-roll rebuild applies this roll's choice.
+        startInversion(ws, layout: captureMode, monochrome: monochrome,
+                       carrier: selectedOnly ? appliedCarrierMaskEnabled : carrierMaskEnabled,
+                       lcc: lccURLs, only: only, forceRebuild: !selectedOnly)
+    }
+
+    private func startInversion(_ ws: Workspace, layout: Invert.Layout, monochrome: Bool,
+                                carrier: Bool, lcc: [URL], only: Set<String>?, forceRebuild: Bool = false) {
+        let generation = rollGeneration, cancellation = RollCancellation(), keepSelection = selected
+        inversionCancellation = cancellation; inverting = true
+        loadRollTask?.cancel()
+        for frame in frames { frame.cancelLoad() }
+        status = "Processing captures…"
         Task.detached(priority: .userInitiated) {
             do {
                 try ws.makeDirs()
                 try Invert.run(dir: ws.captures, layout: layout, perFrameBase: true,
-                               out: ws.cache, lcc: lcc, monochrome: bw) { msg in
-                    Task { @MainActor in self.status = msg }
-                }
-            } catch {
-                let m = error.localizedDescription
+                    out: ws.cache, only: only, forceRebuild: forceRebuild, lcc: lcc, monochrome: monochrome,
+                    carrierMaskEnabled: carrier,
+                    cancellation: { cancellation.isCancelled },
+                    progress: { message in
+                        Task { @MainActor in
+                            if generation == self.rollGeneration, !cancellation.isCancelled { self.status = message }
+                        }
+                    })
                 await MainActor.run {
                     self.inverting = false
-                    self.status = "inversion failed: \(m)"
-                }
-                return
-            }
-            await MainActor.run { self.inverting = false; self.open(ws) }
-        }
-    }
-
-    /// Re-run the inversion. Nothing is destroyed that cannot be regenerated,
-    /// and your corrections in edits.json are untouched — they key off the frame
-    /// name, not the master's contents.
-    func reinvert(selectedOnly: Bool) {
-        guard let ws = workspace else { status = "No roll open"; return }
-        // One inversion at a time. Both entry points are a single click away and
-        // two runs write the same masters and the same session file.
-        guard !inverting else { status = "already inverting"; return }
-        let only: Set<String>? = selectedOnly ? current.map { [$0.name] } : nil
-        if selectedOnly && only == nil { status = "No frame selected"; return }
-        let lcc = lccURLs
-        // DEV-MONO: the operator's choice, NOT a second guess at the files. This
-        // used to call detectLayout again, which would have silently overturned
-        // any capture mode picked at import.
-        let layout = captureMode
-        let bw = monochrome
-        let target = selectedOnly ? current : nil
-        let label = selectedOnly ? (current?.name ?? "") : "\(frames.count) frames"
-        status = "re-inverting \(label)…"
-
-        let keepSel = selected
-        inverting = true
-        Task.detached(priority: .userInitiated) {
-            do {
-                let caps = ((try? FileManager.default.contentsOfDirectory(at: ws.captures,
-                                includingPropertiesForKeys: nil)) ?? [])
-                    .filter { ["tif", "tiff", "png"].contains($0.pathExtension.lowercased())
-                              && !Invert.isLCC($0) }
-                guard !caps.isEmpty else {
-                    await MainActor.run {
-                        self.inverting = false
-                        self.status = "cannot read captures"
-                    }
-                    return
-                }
-                try Invert.run(dir: ws.captures, layout: layout, perFrameBase: true,
-                               out: ws.cache, only: only,
-                               lcc: lcc, monochrome: bw) { msg in
-                    Task { @MainActor in self.status = msg }
-                }
-            } catch {
-                let m = error.localizedDescription
-                await MainActor.run {
-                    self.inverting = false
-                    self.status = "re-invert failed: \(m)"
-                }
-                return
-            }
-            // Cleared BEFORE the reload paths below, because those call
-            // `updateSession` indirectly and it now refuses while this is set.
-            await MainActor.run { self.inverting = false }
-            // Only the frame that changed is re-read. Rebuilding the whole roll
-            // meant re-decoding every master to fix one frame.
-            if let target {
-                await target.reload()
-                await MainActor.run {
-                    // The rectangle it was just re-detected with. Without this the
-                    // store kept the OLD one, so turning border detection off and
-                    // re-inverting -- the documented escape hatch for a misread
-                    // frame -- left the bad mask in place.
-                    if let sess = Invert.loadSession(beside: ws.cache) {
-                        let d0 = Invert.Border.gate(of: self.frameRects)
-                        let was = d0
-                        self.frameRects = sess.frameBorders
-                        // DEV-GATE: re-detecting one frame can WIDEN the roll's
-                        // gate, and the gate masks every frame's statistics --
-                        // so when it moves, every frame has to re-measure.
-                        // Only then: this path exists to avoid rebuilding the
-                        // whole roll to fix one frame, and a re-invert usually
-                        // does not touch the worst side.
-                        let d1 = Invert.Border.gate(of: self.frameRects)
-                        let gate = d1
-                        for f in self.frames {
-                            f.frameRect = self.frameRects[f.name]
-                            f.statsGate = gate
-                        }
-                        if gate != was {
-                            let stale = self.frames.filter { $0 !== target }
-                            Task { for f in stale { await f.reload() } }
-                        }
-                    }
-                    self.status = "re-inverted \(label)"
-                }
-            } else {
-                await MainActor.run {
+                    guard generation == self.rollGeneration, !cancellation.isCancelled else { return }
                     self.open(ws)
-                    self.selected = min(keepSel, max(self.frames.count - 1, 0))
-                    self.status = "re-inverted \(label)"
+                    self.selected = min(keepSelection, max(self.frames.count - 1, 0))
+                    self.recordRecent(ws.captures)
+                }
+            } catch {
+                await MainActor.run {
+                    self.inverting = false
+                    if generation == self.rollGeneration {
+                        let session = Invert.loadSession(beside: ws.cache)
+                        if let pending = session?.pendingCarrierMaskEnabled {
+                            self.carrierMaskEnabled = pending
+                        }
+                        if session?.pendingCarrierMaskEnabled != nil
+                            || CacheManifest.status(captures: ws.captures, cache: ws.cache) != .complete {
+                            self.carrierMaskRequiresReinversion = true
+                        }
+                        self.status = cancellation.isCancelled ? "Processing cancelled" : "Processing stopped: \(error.localizedDescription)"
+                        self.loadRollTask = Task { await self.loadAll() }
+                    }
                 }
             }
         }
     }
 
     func openPanel() {
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.prompt = "Open roll"
-        let pick = attachRollPicker(panel)
-        if panel.runModal() == .OK, let u = panel.url {
-            closeRoll()                  // before any roll property is assigned
-            applyRollPicker(pick, folder: u)
-            accept(u)
+        guard !isPresentingDialog else { status = "Close the current dialog first"; return }
+        guard !isProcessing else { status = "Finish current processing first"; return }
+        guard let parent = dialogParentWindow else { return }
+        isPresentingRoll = true
+        Task { @MainActor in
+            let chooser = NSOpenPanel()
+            chooser.canChooseDirectories = true
+            chooser.canChooseFiles = false
+            chooser.prompt = "Open roll"
+            let response: NSApplication.ModalResponse = await withCheckedContinuation { continuation in
+                chooser.beginSheetModal(for: parent) { continuation.resume(returning: $0) }
+            }
+            chooser.orderOut(nil)
+            isPresentingRoll = false
+            if response == .OK, let url = chooser.url { accept(url) }
         }
     }
 
@@ -1332,7 +1480,7 @@ extension RollStore {
     /// `nonisolated` because the panel accessory reads it while being built:
     /// FileManager is safe off the main actor, as `loadRecents` already relies on.
     nonisolated static func captures(in dir: URL) -> [URL] {
-        let exts: Set<String> = ["tif", "tiff", "png"]
+        let exts = CaptureDecoder.supportedExtensions
         return ((try? FileManager.default.contentsOfDirectory(
                     at: dir, includingPropertiesForKeys: nil)) ?? [])
             .filter { exts.contains($0.pathExtension.lowercased()) && !Invert.isLCC($0) }
@@ -1433,6 +1581,9 @@ func installKeyMonitor(_ store: RollStore) {
         return ev
     }
     NSEvent.addLocalMonitorForEvents(matching: .keyDown) { ev in
+        if store.isPresentingDialog || NSApp.modalWindow != nil
+            || NSApp.keyWindow?.sheetParent != nil || NSApp.mainWindow?.attachedSheet != nil
+            || NSApp.keyWindow?.firstResponder is NSTextView { return ev }
         let shift = ev.modifierFlags.contains(.shift)
         if ev.modifierFlags.contains(.command),
            ev.charactersIgnoringModifiers?.lowercased() == "z" {

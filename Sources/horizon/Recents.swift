@@ -17,9 +17,71 @@ import SwiftUI
 // Recent submenu in main.swift.
 // =======================================================================
 
+/// A read-only snapshot for one recent roll. Loading never creates a workspace
+/// or metadata sidecar; a corrupt sidecar stays untouched and is represented as
+/// unavailable so the list cannot mistake it for newly empty metadata.
+struct RecentRoll: Identifiable {
+    let url: URL
+    let id: String
+    let metadata: RollMetadata?
+    let metadataIssue: String?
+
+    var title: String {
+        url.lastPathComponent
+    }
+
+    var subtitle: String {
+        if metadataIssue != nil { return "Metadata unavailable" }
+        return metadata?.recentOrderSummary ?? ""
+    }
+
+    var tooltip: String {
+        var lines = [url.path]
+        if let metadata {
+            let fields: [(String, String)] = [
+                ("Title", metadata.title), ("Stock", metadata.stock),
+                ("Format", metadata.format), ("Box ISO", metadata.boxISO),
+                ("Shooting EI", metadata.shootingEI), ("Camera", metadata.filmCamera),
+                ("Lens", metadata.filmLens), ("Photographic date", metadata.photographDate),
+                ("Location", metadata.location), ("Development", metadata.developmentNotes)
+            ]
+            lines += fields.compactMap { label, value in
+                let value = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                return value.isEmpty ? nil : "\(label): \(value)"
+            }
+            if fields.allSatisfy({ $0.1.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) {
+                lines.append("No photographic metadata recorded")
+            }
+        } else if let metadataIssue {
+            lines.append("Metadata unavailable: \(metadataIssue)")
+        } else {
+            lines.append("No photographic metadata recorded")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    init(url: URL) {
+        self.url = url
+        id = url.standardizedFileURL.resolvingSymlinksInPath().path
+        let metadataURL = Workspace(anyOf: url).metadata
+        guard FileManager.default.fileExists(atPath: metadataURL.path) else {
+            metadata = nil
+            metadataIssue = nil
+            return
+        }
+        do {
+            metadata = try RollPersistence.loadMetadata(from: metadataURL)
+            metadataIssue = nil
+        } catch {
+            metadata = nil
+            metadataIssue = error.localizedDescription
+        }
+    }
+}
+
 extension RollStore {
     private nonisolated static let recentsKey = "recentRolls"
-    /// Eight fits the panel without scrolling. A convenience, not an archive.
+    /// Keep eight recent orders; the panel scrolls after five visible rows.
     private nonisolated static let recentsMax = 8
 
     /// Folders opened before, newest first, filtered to ones still on disk.
@@ -38,6 +100,11 @@ extension RollStore {
             UserDefaults.standard.set(live, forKey: recentsKey)
         }
         return live.map { URL(fileURLWithPath: $0) }
+    }
+
+    /// Recent list snapshots keep metadata reads out of SwiftUI body updates.
+    nonisolated static func loadRecentOrders() -> [RecentRoll] {
+        loadRecents().map(RecentRoll.init(url:))
     }
 
     /// Drop one roll from the list, by resolved path so it matches however the
@@ -61,7 +128,11 @@ extension RollStore {
         }
         paths.insert(key, at: 0)
         UserDefaults.standard.set(Array(paths.prefix(Self.recentsMax)), forKey: Self.recentsKey)
-        recents = Self.loadRecents()
+        refreshRecents()
+    }
+
+    func refreshRecents() {
+        recents = Self.loadRecentOrders()
     }
 }
 
@@ -95,56 +166,75 @@ struct RecentRolls: View {
                     .frame(maxWidth: .infinity)
                     .background(Color.white)
             } else {
-                ForEach(Array(store.recents.enumerated()), id: \.element) { i, url in
-                    Row(index: i + 1, url: url, store: store)
-                        .background(i % 2 == 0 ? Color.white : FUI.hex(0xF0F0F0))
+                ScrollView(.vertical) {
+                    LazyVStack(spacing: 0) {
+                        ForEach(Array(store.recents.enumerated()), id: \.element.id) { i, roll in
+                            Row(index: i + 1, roll: roll, store: store)
+                                .background(i % 2 == 0 ? Color.white : FUI.hex(0xF0F0F0))
+                        }
+                    }
                 }
+                .frame(height: CGFloat(min(store.recents.count, 5) * 32))
             }
         }
-        .frame(width: 420)
+        .frame(width: 560)
         .overlay(Rectangle().strokeBorder(FUI.outline.opacity(0.55), lineWidth: 1))
         .bevel(up: false)
+        .onAppear { store.refreshRecents() }
     }
 
     private struct Row: View {
         let index: Int
-        let url: URL
+        let roll: RecentRoll
         @ObservedObject var store: RollStore
         @State private var hot = false
 
-        /// Home abbreviated, and only the containing folder kept. The full path
-        /// of a scan folder is long enough to push the name off the row, and the
-        /// name is the part being recognised.
-        private var where_: String {
-            let parent = url.deletingLastPathComponent().path
-            let home = FileManager.default.homeDirectoryForCurrentUser.path
-            return parent.hasPrefix(home)
-                ? "~" + parent.dropFirst(home.count) : parent
-        }
-
         var body: some View {
-            Button { store.accept(url) } label: {
-                HStack(spacing: 8) {
-                    Text("\(index)")
-                        .font(FUI.small())
-                        .foregroundStyle(FUI.ink.opacity(0.5))
-                        .frame(width: 14, alignment: .trailing)
-                    Text(url.lastPathComponent)
-                        .font(FUI.label())
-                        .foregroundStyle(FUI.ink)
-                        .lineLimit(1)
-                    Spacer(minLength: 8)
-                    Text(where_)
-                        .font(FUI.small())
-                        .foregroundStyle(FUI.ink.opacity(0.45))
-                        .lineLimit(1)
-                        .truncationMode(.head)
+            HStack(spacing: 8) {
+                Button { store.accept(roll.url) } label: {
+                    HStack(spacing: 6) {
+                        Text("\(index)")
+                            .font(FUI.small())
+                            .foregroundStyle(FUI.ink.opacity(0.5))
+                            .frame(width: 14, alignment: .trailing)
+                        Text(roll.title)
+                            .font(FUI.label())
+                            .foregroundStyle(FUI.ink)
+                            .lineLimit(1)
+                            .layoutPriority(1)
+                        if !roll.subtitle.isEmpty {
+                            Text("·")
+                                .font(FUI.small())
+                                .foregroundStyle(FUI.ink.opacity(0.38))
+                            Text(roll.subtitle)
+                                .font(FUI.small())
+                                .foregroundStyle(FUI.ink.opacity(0.5))
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                                .help(roll.subtitle)
+                        }
+                        Spacer(minLength: 0)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
                 }
-                .padding(.horizontal, 8)
-                .frame(height: 22)
-                .contentShape(Rectangle())
+                .buttonStyle(.plain)
+                .help(roll.tooltip)
+
+                Button { store.editRecentMetadata(roll.url) } label: {
+                    Image(systemName: "pencil")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(FUI.ink.opacity(0.65))
+                        .frame(width: 22, height: 24)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Edit metadata for \(roll.title)")
+                .disabled(!store.canEditRecentMetadata)
+                .help("Edit photographic metadata")
             }
-            .buttonStyle(.plain)
+            .padding(.horizontal, 8)
+            .frame(height: 32)
             .background(hot ? FUI.tealRule.opacity(0.12) : .clear)
             .onHover { hot = $0 }
         }

@@ -5,8 +5,9 @@ let package = Package(
     name: "horizon",
     platforms: [.macOS(.v14)],
     targets: [
-        // No dependencies. ImageIO reads/writes 16-bit TIFF (including the
-        // zstd-compressed masters tifffile writes), Accelerate does the LUT.
+        // No package dependencies. ImageIO reads/writes TIFF; Core Image's
+        // CIRAWFilter decodes supported camera RAW captures in memory; Accelerate
+        // implements the LUT path.
         .executableTarget(name: "horizon", path: "Sources/horizon")
     ]
 )
