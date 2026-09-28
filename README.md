@@ -1,10 +1,6 @@
--# Horizon
-
 ![Horizon](Resources/icon-readme.png)
 
 Horizon is a macOS app for turning camera scans of colour and black-and-white film negatives into positive photographs. Import a roll, balance its frames, and export with your own filenames and photographic metadata.
-
-[Quick workflow guide](WORKFLOW_GUIDE.md) · [Release notes](RELEASE_NOTES.md)
 
 ![Screenshot of a trichromatic scan session](Resources/sample.png)
 
@@ -143,8 +139,6 @@ The regression runner removes its temporary fixtures, executable, and module cac
 
 ## Horizon quick workflow guide
 
-[README](README.md) · [Release notes](RELEASE_NOTES.md)
-
 ### 1. Import a roll
 
 Keep one roll's captures in a folder. Drop it onto Horizon or choose **File → New Roll…** (⌘N). TIFF, PNG, and camera RAW supported by Apple's decoder use the same workflow; RAW needs no intermediate conversion file.
@@ -155,6 +149,8 @@ In the import sheet:
 - Choose **Colour negative** or **Black & white negative** where available.
 - Fill in **Roll metadata**. Select the film stock and format; catalog stocks fill box ISO and default EI to box speed. Change EI if you rated the film differently.
 - Add a camera, lens, date, location, or development notes if known. The date picker supports a full date, month and year, or year only. Unknown fields can stay empty.
+
+![Import Metadata view](Resources/import_metadata.png)
 
 Choose **Import Roll** and let inversion finish. Automatic carrier handling starts on. Reopen finished rolls through **Recent Orders** or **File → Open Recent**.
 
@@ -192,12 +188,17 @@ The choice is saved for that roll. While a change is pending, export, colour cor
 
 Click the editing header or choose **File → Roll Settings…** to check the roll metadata. You can also use a Recent Orders row's pencil button without opening the photographs. Metadata edits need no re-inversion. The header and recent list show only **film stock · camera · year**, with empty fields omitted.
 
+![Import Metadata view](Resources/metadata_menu.png)
+
 Choose **File → Export Selected Frame** (⌘E) or **Export All Frames** (⇧⌘E), then select a destination. In the export sheet:
 
 1. Choose **Use chosen folder**, **Create roll title folder**, or **Create custom folder**. Keep exports in their own folder or subfolder, separate from source captures.
 2. Set a filename pattern. Click the token buttons to insert at the cursor or replace selected text; type any fixed text and separators you want. Leave off the file extension.
 3. Check the live example. For example, `{date}_{roll}_{frame:03}` can become `2026-09_Valencia_012.tif`. Other tokens are `{stock}` and `{original}`. Empty metadata produces empty token values.
 4. Select **16-bit TIFF**, **JPEG**, or both. Enable **Crop to detected frame** if wanted, then choose **Export**.
+
+![Import Metadata view](Resources/export_menu.png)
+
 
 The selected frame keeps its number within the roll. If a name already exists or several frames would receive the same name, change the pattern or destination. Photographic metadata is included where the format supports it.
 
